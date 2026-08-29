@@ -4,6 +4,9 @@ name: Release
 # Tag convention: vX.Y.Z-llmw.N — upstream baseline vX.Y.Z plus N fork releases.
 # npm/package.json is intentionally kept byte-identical to upstream in git;
 # the npm publish job injects name/version from the tag at publish time.
+# npm publish uses Trusted Publishing (OIDC) — no NPM_TOKEN secret; configure a
+# trusted publisher on npmjs.com for @yzr95924/llmw-connect pointing at this
+# repo with workflow filename "release.yml".
 
 on:
   push:
@@ -80,6 +83,13 @@ jobs:
     name: Publish npm package (@yzr95924/llmw-connect)
     needs: build-release
     runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC): no NPM_TOKEN secret; npm exchanges the GitHub
+    # Actions OIDC token for a short-lived publish token. Requires a trusted
+    # publisher configured on npmjs.com for this package with workflow filename
+    # "release.yml". npm CLI >= 11.5.1 ships with node-version 24.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout (tag)
         uses: actions/checkout@v4
@@ -87,10 +97,11 @@ jobs:
           ref: ${{ env.TAG }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false  # never use caching in release builds
 
       - name: Inject fork package identity (kept out of git by design)
         working-directory: npm
@@ -112,8 +123,6 @@ jobs:
           [ "$actual" = "$expected" ] || { echo "::error::version mismatch: $actual != $expected"; exit 1; }
           echo "version OK: $actual"
 
-      - name: Publish
+      - name: Publish (OIDC trusted publishing — no token)
         working-directory: npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
