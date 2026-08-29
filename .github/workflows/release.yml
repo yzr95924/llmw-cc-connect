@@ -97,10 +97,10 @@ jobs:
         run: |
           npm pkg set name="@yzr95924/llmw-connect" \
                       version="${TAG#v}" \
-                      repository.url="git+https://github.com/yzr95924/cc-connect.git" \
+                      repository.url="git+https://github.com/yzr95924/llmw-cc-connect.git" \
                       repository.type="git" \
-                      homepage="https://github.com/yzr95924/cc-connect#readme" \
-                      bugs.url="https://github.com/yzr95924/cc-connect/issues" \
+                      homepage="https://github.com/yzr95924/llmw-cc-connect#readme" \
+                      bugs.url="https://github.com/yzr95924/llmw-cc-connect/issues" \
                       description="Fork of cc-connect with llmw wiki agent support (bin: cc-connect)"
           cat package.json
 

@@ -13,7 +13,7 @@ The binary is still `cc-connect` — same engine, same platforms, plus the `llmw
 npm install -g @yzr95924/llmw-connect
 ```
 
-Binaries are downloaded from [GitHub Releases](https://github.com/yzr95924/cc-connect/releases)
+Binaries are downloaded from [GitHub Releases](https://github.com/yzr95924/llmw-cc-connect/releases)
 at install time (same wrapper mechanism as upstream).
 
 ## Usage
@@ -42,5 +42,5 @@ and version are injected by CI from the release tag. Do not edit `npm/package.js
 
 ## Documentation
 
-- Fork: https://github.com/yzr95924/cc-connect
+- Fork: https://github.com/yzr95924/llmw-cc-connect
 - Upstream docs: https://github.com/chenhg5/cc-connect

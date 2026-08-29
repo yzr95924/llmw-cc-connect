@@ -13,7 +13,7 @@ const PACKAGE = require("./package.json");
 const VERSION = `v${PACKAGE.version}`;
 const NAME = "cc-connect";
 
-const GITHUB_REPO = "yzr95924/cc-connect";
+const GITHUB_REPO = "yzr95924/llmw-cc-connect";
 
 const PLATFORM_MAP = {
   darwin: "darwin",
