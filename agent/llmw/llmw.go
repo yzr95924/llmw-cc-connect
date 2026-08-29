@@ -25,8 +25,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/chenhg5/cc-connect/agent/claudecode"
-	"github.com/chenhg5/cc-connect/agent/opencode"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -236,12 +234,19 @@ func (a *llmwAgent) cleanupLegacyWikisCommand(dir string) {
 	slog.Warn("llmw: legacy wikis.md kept (user-modified); /wikis no longer advertised, remove manually if unwanted", "path", path)
 }
 
-// realInnerFactory builds the wrapped backend agent with opts for the wiki.
+// realInnerFactory builds the wrapped backend agent via the core registry
+// instead of importing the agent packages directly. This keeps agent/llmw
+// compile-decoupled from the actively-developed claudecode/opencode packages
+// (their New signatures can change without breaking us) and honours build
+// exclusion: with EXCLUDE=claudecode the backend is genuinely absent and
+// StartSession fails with a clear "unknown agent" error instead of silently
+// pulling the excluded package back into the binary.
 func (a *llmwAgent) realInnerFactory(opts map[string]any) (core.Agent, error) {
-	if a.backend == "opencode" {
-		return opencode.New(opts)
+	name := a.backend
+	if name == "claude" {
+		name = "claudecode" // config name → registry name
 	}
-	return claudecode.New(opts)
+	return core.CreateAgent(name, opts)
 }
 
 // newInnerAgent returns a wrapped backend agent whose work_dir is the given wiki.

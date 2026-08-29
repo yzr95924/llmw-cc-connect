@@ -60,6 +60,8 @@ backend = "claude"    # "claude"（默认）或 "opencode"
   `llmw wiki --name=X enter` 同步 byobu 窗口并刷新 overlay；关闭或失败时 IM 侧
   **降级继续**（只告警，不影响进入）。
 - 内层 CLI：`claude` / `opencode` 需已安装（启动失败会 IM 报错）。
+- 内层 agent 经 core 注册表创建（`core.CreateAgent`）：`make build EXCLUDE=claudecode`
+  等排除构建会**真实移除**对应 backend，进入 wiki 时显式报 "unknown agent"。
 
 ## 已知限制（v1）
 

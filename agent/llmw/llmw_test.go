@@ -221,6 +221,38 @@ func TestRegistrationAndValidate(t *testing.T) {
 	}
 }
 
+func TestRealInnerFactoryMapping(t *testing.T) {
+	// Register throwaway factories under the real registry names to observe
+	// the mapping without importing the actual agent packages (agent/llmw is
+	// deliberately decoupled from them; the smoke binary registers the real
+	// ones via blank imports).
+	var got []string
+	core.RegisterAgent("claudecode", func(opts map[string]any) (core.Agent, error) {
+		got = append(got, "claudecode")
+		return &fakeInnerAgent{}, nil
+	})
+	core.RegisterAgent("opencode", func(opts map[string]any) (core.Agent, error) {
+		got = append(got, "opencode")
+		return &fakeInnerAgent{}, nil
+	})
+
+	for backend, want := range map[string]string{"claude": "claudecode", "opencode": "opencode"} {
+		a := &llmwAgent{backend: backend}
+		if _, err := a.realInnerFactory(map[string]any{}); err != nil {
+			t.Fatalf("backend %s: %v", backend, err)
+		}
+		if len(got) == 0 || got[len(got)-1] != want {
+			t.Errorf("backend %q should create registry agent %q, got %v", backend, want, got)
+		}
+	}
+
+	// Unknown backend surfaces the registry error explicitly.
+	a := &llmwAgent{backend: "nope"}
+	if _, err := a.realInnerFactory(map[string]any{}); err == nil {
+		t.Error("unknown backend must fail via registry lookup")
+	}
+}
+
 func TestNew(t *testing.T) {
 	// Bad backend.
 	if _, err := New(map[string]any{"backend": "nope"}); err == nil {

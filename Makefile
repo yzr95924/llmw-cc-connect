@@ -35,9 +35,13 @@ PLATFORMS := \
 
 ALL_AGENTS    := acp antigravity claudecode codex copilot cursor devin gemini iflow kimi opencode pi qoder tmux
 ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex wps-agentspace tuitui
-ALL_AGENTS    := acp antigravity claudecode codex copilot cursor devin gemini iflow kimi llmw opencode pi qoder reasonix tmux
+ALL_AGENTS    := acp antigravity claudecode codex copilot cursor devin gemini iflow kimi opencode pi qoder reasonix tmux
 ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex cloud_web tuitui googlechat
 ALL_EXTRAS    := web
+# fork addition (agent/llmw): appended on its own line so upstream edits to the
+# lists above never conflict on rebase. Remove this line together with the
+# agent/llmw directory when dropping fork support.
+ALL_AGENTS    += llmw
 
 COMMA := ,
 
