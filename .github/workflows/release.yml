@@ -1,0 +1,119 @@
+name: Release
+
+# Fork release pipeline (llmw-support).
+# Tag convention: vX.Y.Z-llmw.N — upstream baseline vX.Y.Z plus N fork releases.
+# npm/package.json is intentionally kept byte-identical to upstream in git;
+# the npm publish job injects name/version from the tag at publish time.
+
+on:
+  push:
+    tags: ['v*-llmw.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to release (e.g. v1.5.0-llmw.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build-release:
+    name: Build & upload release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (tag)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - name: Verify tag matches fork convention
+        run: |
+          echo "TAG=$TAG"
+          case "$TAG" in
+            v*-llmw.*) echo "OK: $TAG" ;;
+            *) echo "::error::tag '$TAG' does not match v*-llmw.*"; exit 1 ;;
+          esac
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Build all platforms (web + binaries + archives + checksums)
+        run: make release-all VERSION="$TAG"
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          draft: false
+          prerelease: ${{ contains(env.TAG, '-') }}
+          files: |
+            dist/cc-connect-*.tar.gz
+            dist/cc-connect-*.zip
+            dist/checksums.txt
+          body: |
+            Fork release of cc-connect with the llmw wiki agent.
+
+            See [npm/README.md](npm/README.md) for what this fork adds, and
+            upstream's CHANGELOG.md for the base release contents.
+
+            Install: `npm install -g @yzr95924/llmw-connect`
+
+  npm-publish:
+    name: Publish npm package (@yzr95924/llmw-connect)
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (tag)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: https://registry.npmjs.org
+
+      - name: Inject fork package identity (kept out of git by design)
+        working-directory: npm
+        run: |
+          npm pkg set name="@yzr95924/llmw-connect" \
+                      version="${TAG#v}" \
+                      repository.url="git+https://github.com/yzr95924/cc-connect.git" \
+                      repository.type="git" \
+                      homepage="https://github.com/yzr95924/cc-connect#readme" \
+                      bugs.url="https://github.com/yzr95924/cc-connect/issues" \
+                      description="Fork of cc-connect with llmw wiki agent support (bin: cc-connect)"
+          cat package.json
+
+      - name: Sanity-check injected version matches tag
+        working-directory: npm
+        run: |
+          expected="${TAG#v}"
+          actual=$(node -p "require('./package.json').version")
+          [ "$actual" = "$expected" ] || { echo "::error::version mismatch: $actual != $expected"; exit 1; }
+          echo "version OK: $actual"
+
+      - name: Publish
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
