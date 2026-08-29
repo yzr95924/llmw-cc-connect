@@ -44,7 +44,15 @@ func main() {
 		}
 	}()
 
-	for _, cmd := range []string{"/wikis", "/enter agent-tools"} {
+	// NOTE: stop targets a non-existent wiki on purpose — killing a real
+	// byobu window of an existing wiki could destroy a live agent session.
+	// The happy path of stop is covered by unit tests.
+	for _, cmd := range []string{
+		"/llmw list",
+		"/llmw enter agent-tools",
+		"/llmw status",
+		"/llmw wiki --name=no-such-wiki stop",
+	} {
 		fmt.Println(">>> send:", cmd)
 		if err := sess.Send(cmd, "", nil, nil); err != nil {
 			fmt.Println("Send:", err)

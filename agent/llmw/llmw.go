@@ -34,12 +34,18 @@ const (
 	agentName      = "llmw"
 	defaultBackend = "claude"
 	commandsSubdir = "llmw-commands"
-	wikisSentinel  = "<llmw:wikis>"
+	menuSentinel   = "<llmw:menu>"
 
-	// wikisCommand is the content of the /wikis agent command file, written to
+	// menuCommand is the content of the /llmw agent command file, written to
 	// the commands dir at New(). First line becomes the command description in
 	// platform menus; the sentinel line lets Send() recognise the expansion.
-	wikisCommand = "列出当前 workspace 的 wiki（回复序号进入）\n<llmw:wikis>"
+	menuCommand = "llmw workspace 窗口与会话管理（status/list/enter/stop）\n<llmw:menu>"
+
+	// legacyWikisCommand is the v2 content of wikis.md (superseded by the
+	// /llmw prefix family, design §7.5). installCommands removes wikis.md
+	// when its content still matches this constant (self-cleanup of the
+	// agent's own artifact); user-modified files are kept with a warning.
+	legacyWikisCommand = "列出当前 workspace 的 wiki（回复序号进入）\n<llmw:wikis>"
 )
 
 func init() {
@@ -182,9 +188,11 @@ func (a *llmwAgent) CommandDirs() []string {
 	return []string{a.commandsDir}
 }
 
-// installCommands writes the /wikis agent command file into a writable
+// installCommands writes the /llmw agent command file into a writable
 // directory (under cc_data_dir) that the engine scans for agent commands.
-// Existing files are not overwritten so users can customise them.
+// Existing files are not overwritten so users can customise them. It also
+// removes the superseded v2 wikis.md when it still holds the agent-generated
+// constant (hard cutover, design §7.5).
 func (a *llmwAgent) installCommands() error {
 	dataDir, _ := a.baseOpts["cc_data_dir"].(string)
 	if dataDir == "" {
@@ -198,14 +206,34 @@ func (a *llmwAgent) installCommands() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("llmw: mkdir commands dir: %w", err)
 	}
-	path := filepath.Join(dir, "wikis.md")
+	path := filepath.Join(dir, "llmw.md")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.WriteFile(path, []byte(wikisCommand), 0o644); err != nil {
-			return fmt.Errorf("llmw: write wikis.md: %w", err)
+		if err := os.WriteFile(path, []byte(menuCommand), 0o644); err != nil {
+			return fmt.Errorf("llmw: write llmw.md: %w", err)
 		}
 	}
+	a.cleanupLegacyWikisCommand(dir)
 	a.commandsDir = dir
 	return nil
+}
+
+// cleanupLegacyWikisCommand deletes the v2 wikis.md command file when it still
+// contains the agent-generated constant, so the platform command menu no
+// longer advertises the removed /wikis command. A user-modified file is kept
+// (it may hold custom content) with a warning.
+func (a *llmwAgent) cleanupLegacyWikisCommand(dir string) {
+	path := filepath.Join(dir, "wikis.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // absent: nothing to clean
+	}
+	if string(data) == legacyWikisCommand {
+		if err := os.Remove(path); err != nil {
+			slog.Warn("llmw: remove legacy wikis.md", "err", err)
+		}
+		return
+	}
+	slog.Warn("llmw: legacy wikis.md kept (user-modified); /wikis no longer advertised, remove manually if unwanted", "path", path)
 }
 
 // realInnerFactory builds the wrapped backend agent with opts for the wiki.

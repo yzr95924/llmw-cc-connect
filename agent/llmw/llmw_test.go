@@ -235,18 +235,66 @@ func TestNew(t *testing.T) {
 	if ag.backend != defaultBackend {
 		t.Fatalf("backend = %q, want %q", ag.backend, defaultBackend)
 	}
-	// Command dir installed with wikis.md.
-	md := filepath.Join(ag.commandsDir, "wikis.md")
+	// Command dir installed with llmw.md.
+	md := filepath.Join(ag.commandsDir, "llmw.md")
 	data, err := os.ReadFile(md)
 	if err != nil {
-		t.Fatalf("wikis.md not installed: %v", err)
+		t.Fatalf("llmw.md not installed: %v", err)
 	}
-	if !strings.Contains(string(data), wikisSentinel) {
-		t.Fatalf("wikis.md missing sentinel: %q", data)
+	if !strings.Contains(string(data), menuSentinel) {
+		t.Fatalf("llmw.md missing sentinel: %q", data)
 	}
 	// CommandDirs.
 	if len(ag.CommandDirs()) != 1 || ag.CommandDirs()[0] != ag.commandsDir {
 		t.Fatalf("unexpected CommandDirs: %v", ag.CommandDirs())
+	}
+}
+
+func TestInstallCommandsCleansLegacyWikis(t *testing.T) {
+	// Untouched install → no wikis.md at all.
+	a, err := New(map[string]any{"cc_data_dir": t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ag := a.(*llmwAgent)
+	if _, err := os.Stat(filepath.Join(ag.commandsDir, "wikis.md")); !os.IsNotExist(err) {
+		t.Fatal("fresh install must not create wikis.md")
+	}
+
+	// Agent-generated legacy constant → removed.
+	dir := t.TempDir()
+	cmds := filepath.Join(dir, commandsSubdir)
+	if err := os.MkdirAll(cmds, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmds, "wikis.md"), []byte(legacyWikisCommand), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a2, err := New(map[string]any{"cc_data_dir": dir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ag2 := a2.(*llmwAgent)
+	if _, err := os.Stat(filepath.Join(ag2.commandsDir, "wikis.md")); !os.IsNotExist(err) {
+		t.Fatal("legacy wikis.md (unmodified constant) must be removed")
+	}
+
+	// User-modified legacy file → kept.
+	dir2 := t.TempDir()
+	cmds2 := filepath.Join(dir2, commandsSubdir)
+	if err := os.MkdirAll(cmds2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmds2, "wikis.md"), []byte("customised"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a3, err := New(map[string]any{"cc_data_dir": dir2})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ag3 := a3.(*llmwAgent)
+	if _, err := os.Stat(filepath.Join(ag3.commandsDir, "wikis.md")); err != nil {
+		t.Fatalf("user-modified wikis.md must be kept: %v", err)
 	}
 }
 
@@ -272,30 +320,56 @@ func TestNewStripsModelAndWorkDir(t *testing.T) {
 	}
 }
 
-func TestCommandRecognition(t *testing.T) {
+func TestParseLlmwCommand(t *testing.T) {
 	cases := []struct {
 		prompt string
-		wikis  bool
-		enter  bool
-		name   string
+		ok     bool
+		want   llmwCommand
 	}{
-		{"<llmw:wikis>", true, false, ""},
-		{"列出当前 workspace 的 wiki（回复序号进入）\n<llmw:wikis>", true, false, ""},
-		{"/wikis", true, false, ""},
-		{"/wikis 2", true, false, ""},
-		{"hello world", false, false, ""},
-		{"/enter foo", false, true, "foo"},
-		{"/enter  kv-store", false, true, "kv-store"},
-		{"/enter", false, true, ""},
-		{"/enterprise", false, false, ""},
+		// Menu sentinel → status.
+		{"<llmw:menu>", true, llmwCommand{verb: "status"}},
+		{"llmw workspace 管理\n<llmw:menu>", true, llmwCommand{verb: "status"}},
+		// Bare + short forms.
+		{"/llmw", true, llmwCommand{verb: "status"}},
+		{"/llmw status", true, llmwCommand{verb: "status"}},
+		{"/llmw list", true, llmwCommand{verb: "list"}},
+		{"/llmw enter foo", true, llmwCommand{verb: "enter", name: "foo"}},
+		{"/llmw stop foo", true, llmwCommand{verb: "stop", name: "foo"}},
+		{"/llmw stop foo ingest", true, llmwCommand{verb: "stop", name: "foo", suffix: "ingest"}},
+		// Case-insensitive command word; name keeps case (findWiki is CI).
+		{"/LLMW List", true, llmwCommand{verb: "list"}},
+		{"/llmw enter Foo-Bar", true, llmwCommand{verb: "enter", name: "Foo-Bar"}},
+		// CLI-native form.
+		{"/llmw wiki --name=foo enter", true, llmwCommand{verb: "enter", name: "foo"}},
+		{"/llmw wiki --name=foo stop", true, llmwCommand{verb: "stop", name: "foo"}},
+		{"/llmw wiki --name=foo stop --window-suffix=ing --yes", true, llmwCommand{verb: "stop", name: "foo", suffix: "ing"}},
+		{"/llmw wiki stop --name=foo -y", true, llmwCommand{verb: "stop", name: "foo"}},
+		// Syntax errors still consume the prompt → usage verb.
+		{"/llmw bogus", true, llmwCommand{verb: "usage"}},
+		{"/llmw status extra", true, llmwCommand{verb: "usage"}},
+		{"/llmw enter", true, llmwCommand{verb: "usage"}},
+		{"/llmw stop", true, llmwCommand{verb: "usage"}},
+		{"/llmw wiki", true, llmwCommand{verb: "usage"}},
+		{"/llmw wiki --name=foo", true, llmwCommand{verb: "usage"}},
+		{"/llmw wiki --name=foo show", true, llmwCommand{verb: "usage"}},
+		{"/llmw wiki --name=foo enter --dry-run", true, llmwCommand{verb: "usage"}},
+		// Strict boundary: not llmw commands.
+		{"/llmwx", false, llmwCommand{}},
+		{"/llmwlist", false, llmwCommand{}},
+		{"/wikis", false, llmwCommand{}},
+		{"/enter foo", false, llmwCommand{}},
+		{"hello world", false, llmwCommand{}},
+		{"", false, llmwCommand{}},
+		{"  ", false, llmwCommand{}},
 	}
 	for _, tc := range cases {
-		if got := isWikisCommand(tc.prompt); got != tc.wikis {
-			t.Errorf("isWikisCommand(%q) = %v, want %v", tc.prompt, got, tc.wikis)
+		got, ok := parseLlmwCommand(tc.prompt)
+		if ok != tc.ok {
+			t.Errorf("parseLlmwCommand(%q) ok = %v, want %v", tc.prompt, ok, tc.ok)
+			continue
 		}
-		name, ok := enterCommandName(tc.prompt)
-		if ok != tc.enter || name != tc.name {
-			t.Errorf("enterCommandName(%q) = (%q,%v), want (%q,%v)", tc.prompt, name, ok, tc.name, tc.enter)
+		if ok && got != tc.want {
+			t.Errorf("parseLlmwCommand(%q) = %+v, want %+v", tc.prompt, got, tc.want)
 		}
 	}
 }
@@ -320,3 +394,125 @@ func TestNumeric(t *testing.T) {
 		t.Fatal("expired selection must fail")
 	}
 }
+
+func sampleStatusJSON() string {
+	uptime := 3600.0
+	idle := 120.0
+	ago := 90.0
+	rows := []windowRow{
+		{Wiki: "foo", Window: "foo-main", WindowID: "@3", Session: "llm_workspace",
+			Dead: false, Backend: "claude", State: "working",
+			UptimeSeconds: &uptime, IdleSeconds: &idle},
+		{Wiki: "bar", Window: "bar-ingest", WindowID: "@5", Session: "llm_workspace",
+			Dead: true, Backend: "opencode", State: "dead",
+			DeadSecondsAgo: &ago},
+	}
+	b, _ := json.Marshal(rows)
+	return string(b)
+}
+
+func TestLlmwClientStatus(t *testing.T) {
+	c := newLlmwClient()
+	c.run = fakeRunner(sampleStatusJSON(), "")
+
+	rows, err := c.status(context.Background())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("want 2 rows, got %d", len(rows))
+	}
+	if rows[0].Wiki != "foo" || rows[0].State != "working" || rows[0].UptimeSeconds == nil {
+		t.Fatalf("unexpected row 0: %+v", rows[0])
+	}
+	if !rows[1].Dead || rows[1].DeadSecondsAgo == nil {
+		t.Fatalf("unexpected row 1: %+v", rows[1])
+	}
+}
+
+func TestLlmwClientStatusBadJSON(t *testing.T) {
+	c := newLlmwClient()
+	c.run = fakeRunner("nope", "")
+	if _, err := c.status(context.Background()); err == nil {
+		t.Fatal("want error for bad JSON")
+	}
+}
+
+func TestLlmwClientStopWikiArgs(t *testing.T) {
+	var got [][]string
+	c := newLlmwClient()
+	c.run = func(_ context.Context, args ...string) ([]byte, error) {
+		got = append(got, args)
+		return []byte{}, nil
+	}
+
+	if err := c.stopWiki(context.Background(), "foo", ""); err != nil {
+		t.Fatalf("stopWiki: %v", err)
+	}
+	if err := c.stopWiki(context.Background(), "foo", "ing"); err != nil {
+		t.Fatalf("stopWiki: %v", err)
+	}
+	want0 := []string{"wiki", "--name=foo", "stop", "--yes"}
+	want1 := []string{"wiki", "--name=foo", "stop", "--yes", "--window-suffix=ing"}
+	if len(got) != 2 {
+		t.Fatalf("want 2 invocations, got %d", len(got))
+	}
+	for i := range want0 {
+		if got[0][i] != want0[i] {
+			t.Fatalf("args0 = %v, want %v", got[0], want0)
+		}
+	}
+	for i := range want1 {
+		if got[1][i] != want1[i] {
+			t.Fatalf("args1 = %v, want %v", got[1], want1)
+		}
+	}
+}
+
+func TestLlmwClientStopWikiErrorPassthrough(t *testing.T) {
+	c := newLlmwClient()
+	c.run = fakeRunner("", "llmw wiki --name=foo stop --yes: exit status 1: wiki 'foo' 有 2 个运行中的窗口：...\nhint: 加 --window-suffix=SUFFIX")
+	err := c.stopWiki(context.Background(), "foo", "")
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if !strings.Contains(err.Error(), "--window-suffix") {
+		t.Fatalf("llmw stderr (candidates + hint) must be preserved: %v", err)
+	}
+}
+
+func TestRenderWindows(t *testing.T) {
+	// Empty table.
+	if s := renderWindows(nil); !strings.Contains(s, "没有运行中的窗口") {
+		t.Fatalf("empty render = %q", s)
+	}
+	// Table with alive + dead rows.
+	rows := []windowRow{
+		{Wiki: "foo", Window: "foo-main", Backend: "claude", State: "working",
+			UptimeSeconds: ptrFloat(3700), IdleSeconds: ptrFloat(30)},
+		{Wiki: "bar", Window: "bar-ingest", Backend: "opencode", State: "dead",
+			Dead: true, DeadSecondsAgo: ptrFloat(2 * 86400)},
+	}
+	s := renderWindows(rows)
+	for _, want := range []string{"WIKI", "foo-main", "working", "1h", "exited 2d ago", "dead"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("render missing %q:\n%s", want, s)
+		}
+	}
+}
+
+func TestFmtDur(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{30, "now"}, {90, "1m"}, {3599, "59m"}, {3600, "1h"}, {90000, "1d"},
+	}
+	for _, tc := range cases {
+		if got := fmtDur(tc.in); got != tc.want {
+			t.Errorf("fmtDur(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func ptrFloat(v float64) *float64 { return &v }

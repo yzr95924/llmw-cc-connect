@@ -1,7 +1,7 @@
 # agent/llmw — llmw workspace 整合 agent
 
 把 `llm-workspace-cli`（llmw）的 workspace / wiki 作为一等 agent 接入 cc-connect：
-IM 端发 `/wikis` 列出 wiki，回复序号或 `/enter <wiki名>` 进入，后续消息即与该 wiki
+IM 端发 `/llmw list` 列出 wiki，回复序号或 `/llmw enter <wiki名>` 进入，后续消息即与该 wiki
 的 agent 对话（cwd=wiki 目录，model 用 llmw 写的 overlay）。
 
 **设计文档**：`raw/discussions/cc-connect-llmw-integration-design.md`（设计 v2）。
@@ -36,12 +36,19 @@ backend = "claude"    # "claude"（默认）或 "opencode"
 
 ## 使用
 
+所有命令统一 `/llmw` 前缀（避开 engine 内建命令 `/status` `/stop` `/list` 的 matchPrefix 遮蔽；TG 命令名不允许连字符、菜单点击不能带参数，故为子参数风格）。动词对齐 llmw CLI，同时接受 CLI 原生写法原样粘贴：
+
 | IM 输入 | 行为 |
 | --- | --- |
-| `/wikis` | 列出 workspace 的 wiki（序号 + display_name + model）；TG 命令菜单可见（CommandProvider）|
-| 回复 `1` | 进入第 1 个 wiki（列表 60s 内有效）|
-| `/enter foo` | 按 name / display_name 进入 wiki foo |
+| `/llmw`（菜单点击）/ `/llmw status` | 主机窗口表（wiki / window / backend / state / uptime / idle）+ 本会话绑定 + 用法行；state 为 llmw 的 ASCII 契约值（dead / shell / working / waiting / unknown） |
+| `/llmw list` | 列出 workspace 的 wiki（序号 + display_name + model）；列表 60s 内有效 |
+| 回复 `1` | 进入第 1 个 wiki（数字选择，非命令） |
+| `/llmw enter <名>` | 按 name / display_name 进入 wiki（大小写不敏感，白名单解析） |
+| `/llmw stop <名> [suffix]` | 关该 wiki 的主机 tmux 窗口（`llmw wiki --name=X stop --yes`）；多窗口歧义时 llmw 错误（候选 + hint）原样透传 |
+| `/llmw wiki --name=X enter\|stop [--window-suffix=Y] [--yes]` | CLI 原生语法直通（`--yes` 自动忽略） |
 | 普通消息 | 发给当前 wiki 的 agent |
+
+旧命令 `/wikis`、`/enter` 已移除（v2.1 硬切）；启动时自动清理 agent 自己生成的 `wikis.md` 命令文件（用户改过的保留并告警）。
 
 进入/切 wiki 的回执 ≤3s（claude 冷启动主导，超 5s 报错）。
 
@@ -70,7 +77,7 @@ backend = "claude"    # "claude"（默认）或 "opencode"
 
 | 症状 | 检查 |
 | --- | --- |
-| `/wikis` 报 "llmw 不可用" | `which llmw`；`llmw list --json` 手动跑；`$LLMW_WORKSPACE` 是否指向含 workspace.toml 的目录 |
+| `/llmw list` / `/llmw status` 报 "llmw 不可用" | `which llmw`；`llmw list --json` 手动跑；`$LLMW_WORKSPACE` 是否指向含 workspace.toml 的目录 |
 | 进入报 "无法启动 agent" | `which claude` / `which opencode`；`claude --version` |
 | 进入报 "无法启动 agent 会话" | 看 cc-connect 日志里内层 stderr（`journalctl -u cc-connect`）|
 | byobu 窗口没出现 | `byobu list-windows -t llm_workspace`；`workspace_local.toml` 是否 `enter_byobu = true`（linear 模式不会建窗口，IM 侧不受影响）|

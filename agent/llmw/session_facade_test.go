@@ -181,7 +181,7 @@ func TestFacadeUnboundMessage(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 	ev := waitEvent(f.events, time.Second)
-	if ev == nil || !contains(ev.Content, "先 /wikis") {
+	if ev == nil || !contains(ev.Content, "先 /llmw list") {
 		t.Fatalf("want guidance event, got %+v", ev)
 	}
 }
@@ -191,8 +191,8 @@ func TestFacadeWikisAndNumericEntry(t *testing.T) {
 	f := newFacadeForTest(a)
 	defer f.Close()
 
-	// /wikis → listing with 2 entries.
-	if err := f.Send("/wikis", "", nil, nil); err != nil {
+	// /llmw list → listing with 2 entries.
+	if err := f.Send("/llmw list", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	ev := waitEvent(f.events, time.Second)
@@ -237,7 +237,7 @@ func TestFacadeEnterByNameAndSwitch(t *testing.T) {
 	f := newFacadeForTest(a)
 	defer f.Close()
 
-	if err := f.Send("/enter foo", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter foo", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "已进入 wiki：foo") {
@@ -246,7 +246,7 @@ func TestFacadeEnterByNameAndSwitch(t *testing.T) {
 	oldInner := f.inner
 
 	// Switch to bar.
-	if err := f.Send("/enter bar", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter bar", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "已进入 wiki：bar") {
@@ -263,7 +263,7 @@ func TestFacadeEnterByNameAndSwitch(t *testing.T) {
 	}
 
 	// Same-wiki re-enter → idempotent no-op.
-	if err := f.Send("/enter bar", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter bar", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "已在 wiki：bar") {
@@ -279,7 +279,7 @@ func TestFacadeUnknownWiki(t *testing.T) {
 	f := newFacadeForTest(a)
 	defer f.Close()
 
-	if err := f.Send("/enter nope", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter nope", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	ev := waitEvent(f.events, time.Second)
@@ -293,7 +293,7 @@ func TestFacadeLazyRebuild(t *testing.T) {
 	f := newFacadeForTest(a)
 	defer f.Close()
 
-	if err := f.Send("/enter foo", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter foo", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	waitEvent(f.events, time.Second)
@@ -333,7 +333,7 @@ func TestFacadeByobuSync(t *testing.T) {
 	f := newFacadeForTest(a)
 	defer f.Close()
 
-	if err := f.Send("/enter foo", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter foo", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	waitEvent(f.events, time.Second)
@@ -355,7 +355,7 @@ func TestFacadeByobuSyncFailureDegrades(t *testing.T) {
 	f := newFacadeForTest(a)
 	defer f.Close()
 
-	if err := f.Send("/enter foo", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter foo", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	ev := waitEvent(f.events, time.Second)
@@ -397,13 +397,13 @@ func TestFacadeEventsChannelStable(t *testing.T) {
 	f := newFacadeForTest(a)
 	defer f.Close()
 
-	if err := f.Send("/enter foo", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter foo", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	waitEvent(f.events, time.Second)
 	// Switch wiki; events channel object must stay the same.
 	ch := f.events
-	if err := f.Send("/enter bar", "", nil, nil); err != nil {
+	if err := f.Send("/llmw enter bar", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	waitEvent(f.events, time.Second)
@@ -412,9 +412,228 @@ func TestFacadeEventsChannelStable(t *testing.T) {
 	}
 }
 
+// statusRunner dispatches llmw subprocess calls: list → wikis JSON, status →
+// status JSON, wiki stop → recorded + success (or canned error).
+type statusRunner struct {
+	wikis     []wikiEntry
+	windows   []windowRow
+	stopErr   string
+	stopCalls [][]string
+}
+
+func (r *statusRunner) run(_ context.Context, args ...string) ([]byte, error) {
+	switch {
+	case len(args) >= 2 && args[0] == "list":
+		return []byte(marshalRows(r.wikis)), nil
+	case len(args) >= 1 && args[0] == "status":
+		return []byte(marshalRows(r.windows)), nil
+	case len(args) >= 3 && args[0] == "wiki" && args[2] == "stop":
+		r.stopCalls = append(r.stopCalls, args)
+		if r.stopErr != "" {
+			return nil, errFake(r.stopErr)
+		}
+		return []byte{}, nil
+	case len(args) >= 3 && args[0] == "wiki" && args[2] == "enter":
+		return []byte{}, nil
+	}
+	return nil, errFake("unexpected llmw call: " + strings.Join(args, " "))
+}
+
+func marshalRows[T any](rows []T) string {
+	b, err := json.Marshal(rows)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func newStatusTestAgent(t *testing.T, r *statusRunner) *llmwAgent {
+	t.Helper()
+	a, _, _ := newTestAgent(t, false)
+	a.client.run = r.run
+	return a
+}
+
+func TestFacadeStatusUnbound(t *testing.T) {
+	uptime := 100.0
+	r := &statusRunner{
+		wikis:   []wikiEntry{{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true}},
+		windows: []windowRow{{Wiki: "foo", Window: "foo-main", Backend: "claude", State: "working", UptimeSeconds: &uptime}},
+	}
+	a := newStatusTestAgent(t, r)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw status", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil {
+		t.Fatal("want status event")
+	}
+	for _, want := range []string{"foo-main", "working", "本会话未绑定", "用法：/llmw"} {
+		if !contains(ev.Content, want) {
+			t.Errorf("status missing %q:\n%s", want, ev.Content)
+		}
+	}
+}
+
+func TestFacadeStatusBoundAndEmpty(t *testing.T) {
+	r := &statusRunner{
+		wikis:   []wikiEntry{{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true}},
+		windows: nil,
+	}
+	a := newStatusTestAgent(t, r)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw enter foo", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitEvent(f.events, time.Second)
+
+	// Bare /llmw (menu tap) behaves like status.
+	if err := f.Send("/llmw", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil {
+		t.Fatal("want status event")
+	}
+	for _, want := range []string{"没有运行中的窗口", "本会话绑定：foo", "alive"} {
+		if !contains(ev.Content, want) {
+			t.Errorf("status missing %q:\n%s", want, ev.Content)
+		}
+	}
+}
+
+func TestFacadeStatusUnavailable(t *testing.T) {
+	r := &statusRunner{wikis: []wikiEntry{{Name: "foo", DirExists: true}}}
+	a := newStatusTestAgent(t, r)
+	a.client.run = func(_ context.Context, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "status" {
+			return nil, errFake("llmw status: boom")
+		}
+		return r.run(context.Background(), args...)
+	}
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw status", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil || !contains(ev.Content, "llmw 不可用") {
+		t.Fatalf("want unavailable event, got %q", evStr(ev))
+	}
+}
+
+func TestFacadeStopWindow(t *testing.T) {
+	r := &statusRunner{
+		wikis: []wikiEntry{{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true}},
+	}
+	a := newStatusTestAgent(t, r)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw stop foo", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil || !contains(ev.Content, "已停止 foo") {
+		t.Fatalf("want stop confirmation, got %q", evStr(ev))
+	}
+	want := []string{"wiki", "--name=foo", "stop", "--yes"}
+	if len(r.stopCalls) != 1 || len(r.stopCalls[0]) != len(want) {
+		t.Fatalf("stopCalls = %v", r.stopCalls)
+	}
+	for i := range want {
+		if r.stopCalls[0][i] != want[i] {
+			t.Fatalf("stop args = %v, want %v", r.stopCalls[0], want)
+		}
+	}
+}
+
+func TestFacadeStopWindowWithSuffixViaCLINative(t *testing.T) {
+	r := &statusRunner{
+		wikis: []wikiEntry{{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true}},
+	}
+	a := newStatusTestAgent(t, r)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw wiki --name=foo stop --window-suffix=ing --yes", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil || !contains(ev.Content, "已停止 foo") {
+		t.Fatalf("want stop confirmation, got %q", evStr(ev))
+	}
+	if len(r.stopCalls) != 1 {
+		t.Fatalf("stopCalls = %v", r.stopCalls)
+	}
+	got := r.stopCalls[0]
+	if got[len(got)-1] != "--window-suffix=ing" {
+		t.Fatalf("suffix flag missing: %v", got)
+	}
+}
+
+func TestFacadeStopWindowAmbiguityPassthrough(t *testing.T) {
+	r := &statusRunner{
+		wikis:   []wikiEntry{{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true}},
+		stopErr: "wiki 'foo' 有 2 个运行中的窗口：foo-main / foo-ingest\nhint: 加 --window-suffix=SUFFIX",
+	}
+	a := newStatusTestAgent(t, r)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw stop foo", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil || !contains(ev.Content, "停止失败") || !contains(ev.Content, "--window-suffix") {
+		t.Fatalf("llmw ambiguity error must be forwarded verbatim, got %q", evStr(ev))
+	}
+}
+
+func TestFacadeStopUnknownWiki(t *testing.T) {
+	r := &statusRunner{
+		wikis: []wikiEntry{{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true}},
+	}
+	a := newStatusTestAgent(t, r)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw stop nope", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil || !contains(ev.Content, "未找到 wiki：nope") {
+		t.Fatalf("want not-found event, got %q", evStr(ev))
+	}
+}
+
+func TestFacadeUsageOnBadSyntax(t *testing.T) {
+	r := &statusRunner{
+		wikis: []wikiEntry{{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true}},
+	}
+	a := newStatusTestAgent(t, r)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send("/llmw bogus", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil || !contains(ev.Content, "用法：/llmw") {
+		t.Fatalf("want usage event, got %q", evStr(ev))
+	}
+}
+
 // ---- tiny helpers ----
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
 func stringsHasPrefix(s, prefix string) bool {
 	return strings.HasPrefix(s, prefix)
 }

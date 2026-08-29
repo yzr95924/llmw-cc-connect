@@ -40,8 +40,9 @@ func newSessionFacade(a *llmwAgent, id string) *sessionFacade {
 	}
 }
 
-// Send routes commands (wikis / enter / numeric selection) and forwards
-// ordinary messages to the bound inner session.
+// Send routes /llmw commands (status / list / enter / stop, plus the
+// CLI-native form), numeric selection, and forwards ordinary messages to the
+// bound inner session.
 func (f *sessionFacade) Send(prompt, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -49,8 +50,8 @@ func (f *sessionFacade) Send(prompt, messageID string, images []core.ImageAttach
 		return errClosed
 	}
 
-	if isWikisCommand(prompt) {
-		f.handleWikisLocked()
+	if c, ok := parseLlmwCommand(prompt); ok {
+		f.handleLlmwCommandLocked(c)
 		return nil
 	}
 	if isNumeric(prompt) {
@@ -59,24 +60,16 @@ func (f *sessionFacade) Send(prompt, messageID string, images []core.ImageAttach
 			return nil
 		}
 		if f.pendingActiveLocked() {
-			f.emitLocked("序号无效：请输入 1-" + strconv.Itoa(len(f.pending.list)) + "（或 /wikis 重新查看）")
+			f.emitLocked("序号无效：请输入 1-" + strconv.Itoa(len(f.pending.list)) + "（或 /llmw list 重新查看）")
 			return nil
 		}
 		// No active selection: the number is an ordinary message.
-	}
-	if name, ok := enterCommandName(prompt); ok {
-		if name == "" {
-			f.emitLocked("用法：/enter <wiki 名>（或 /wikis 查看列表后回复序号）")
-		} else {
-			f.enterByNameLocked(name)
-		}
-		return nil
 	}
 
 	// Ordinary message: clear any pending selection and forward.
 	f.pending = nil
 	if f.wiki == nil {
-		f.emitLocked("请先 /wikis 选择 wiki（或 /enter <wiki 名>）")
+		f.emitLocked("请先 /llmw list 选择 wiki（或 /llmw enter <wiki 名>）")
 		return nil
 	}
 	if err := f.ensureInnerLocked(); err != nil {
@@ -177,10 +170,73 @@ func (f *sessionFacade) enterByNameLocked(name string) {
 	defer cancel()
 	w, err := f.a.findWiki(ctx, name)
 	if err != nil {
-		f.emitLocked("未找到 wiki：" + name + "。可用 /wikis 查看列表")
+		f.emitLocked("未找到 wiki：" + name + "。可用 /llmw list 查看列表")
 		return
 	}
 	f.enterWikiLocked(w)
+}
+
+// stopWindowLocked kills the wiki's host tmux window via the llmw CLI. Wiki
+// name is whitelist-resolved like enter; llmw errors (no candidate / multiple
+// candidates with a listing + hint) are forwarded verbatim (design §7.5).
+func (f *sessionFacade) stopWindowLocked(name, suffix string) {
+	ctx, cancel := context.WithTimeout(f.a.ctx, listTimeout)
+	defer cancel()
+	w, err := f.a.findWiki(ctx, name)
+	if err != nil {
+		f.emitLocked("未找到 wiki：" + name + "。可用 /llmw list 查看列表")
+		return
+	}
+	sctx, scancel := context.WithTimeout(f.a.ctx, stopTimeout)
+	defer scancel()
+	if err := f.a.client.stopWiki(sctx, w.Name, suffix); err != nil {
+		f.emitLocked("停止失败：" + err.Error())
+		return
+	}
+	f.emitLocked("✓ 已停止 " + w.Name + " 的主机窗口")
+}
+
+// handleStatusLocked renders the host window table (llmw status --json) plus
+// this session's wiki binding and the command usage line (design §7.5).
+func (f *sessionFacade) handleStatusLocked() {
+	ctx, cancel := context.WithTimeout(f.a.ctx, statusTimeout)
+	defer cancel()
+	rows, err := f.a.client.status(ctx)
+	if err != nil {
+		f.emitLocked("llmw 不可用：" + err.Error() + "。请检查 llmw 是否在 PATH / 是否正确安装")
+		return
+	}
+	var b strings.Builder
+	b.WriteString(renderWindows(rows))
+	if f.wiki != nil {
+		state := "dead"
+		if f.inner != nil && f.inner.Alive() {
+			state = "alive"
+		}
+		b.WriteString("\n本会话绑定：" + displayWiki(f.wiki) + "（内层 " + state + "）")
+	} else {
+		b.WriteString("\n本会话未绑定 wiki（/llmw list 后回复序号，或 /llmw enter <名>）")
+	}
+	b.WriteString("\n" + llmwUsage)
+	f.emitLocked(b.String())
+}
+
+// handleLlmwCommandLocked dispatches a parsed /llmw command (design §7.5).
+// The parser guarantees name != "" for enter/stop and maps bad syntax to the
+// "usage" verb, so handlers get well-formed commands only.
+func (f *sessionFacade) handleLlmwCommandLocked(c llmwCommand) {
+	switch c.verb {
+	case "status":
+		f.handleStatusLocked()
+	case "list":
+		f.handleWikisLocked()
+	case "enter":
+		f.enterByNameLocked(c.name)
+	case "stop":
+		f.stopWindowLocked(c.name, c.suffix)
+	default: // "usage"
+		f.emitLocked(llmwUsage)
+	}
 }
 
 // doEnterLocked performs the actual entry: byobu window sync (only when
@@ -229,6 +285,7 @@ func (f *sessionFacade) handleWikisLocked() {
 		b.WriteString(". ")
 		b.WriteString(displayWiki(&available[i]))
 	}
+	b.WriteString("\n（或直接 /llmw enter <名> 进入）")
 	f.emitLocked(b.String())
 	f.pending = &pendingSelection{list: available, deadline: time.Now().Add(pendingSelectionTTL)}
 }
@@ -312,24 +369,191 @@ func displayWiki(w *wikiEntry) string {
 	return name
 }
 
-// isWikisCommand matches both the CommandProvider expansion (wikis.md
-// contains <llmw:wikis>) and the raw "/wikis" text fallback.
-func isWikisCommand(prompt string) bool {
-	if strings.Contains(prompt, wikisSentinel) {
-		return true
-	}
-	p := strings.TrimSpace(prompt)
-	return p == "/wikis" || strings.HasPrefix(p, "/wikis")
+// llmwUsage is the /llmw command usage line (design §7.5).
+const llmwUsage = "用法：/llmw [status] | /llmw list | /llmw enter <wiki> | /llmw stop <wiki> [suffix]（或 CLI 原生 /llmw wiki --name=X enter|stop）"
+
+// llmwCommand is a parsed /llmw command. verb ∈ {status, list, enter, stop,
+// usage}; verb "usage" means the /llmw prefix matched but the syntax did not —
+// the prompt is consumed and the usage line is echoed instead of forwarding
+// it to the inner agent.
+type llmwCommand struct {
+	verb   string
+	name   string // wiki name (enter / stop)
+	suffix string // optional window suffix (stop)
 }
 
-// enterCommandName extracts the wiki name from "/enter <name>".
-func enterCommandName(prompt string) (string, bool) {
-	p := strings.TrimSpace(prompt)
-	if p != "/enter" && !strings.HasPrefix(p, "/enter ") {
-		return "", false
+// parseLlmwCommand recognises the /llmw prefix family with a strict boundary
+// (design §7.5): "/llmw" must end the prompt or be followed by whitespace, so
+// "/llmwx" is an ordinary message. Matching is case-insensitive; wiki names
+// keep their case (findWiki matches case-insensitively). Two grammar forms:
+//
+//   - short form:      /llmw [status] | /llmw list | /llmw enter <name> |
+//                      /llmw stop <name> [suffix]
+//   - CLI-native form: /llmw wiki --name=X enter|stop [--window-suffix=Y] [--yes]
+//
+// The menu expansion (llmw.md) carries the menuSentinel and maps to status.
+func parseLlmwCommand(prompt string) (llmwCommand, bool) {
+	if strings.Contains(prompt, menuSentinel) {
+		return llmwCommand{verb: "status"}, true
 	}
-	name := strings.TrimSpace(strings.TrimPrefix(p, "/enter"))
-	return name, true
+	p := strings.TrimSpace(prompt)
+	if p == "" {
+		return llmwCommand{}, false
+	}
+	fields := strings.Fields(p)
+	if strings.ToLower(fields[0]) != "/llmw" {
+		return llmwCommand{}, false
+	}
+	args := fields[1:]
+
+	if len(args) == 0 {
+		return llmwCommand{verb: "status"}, true
+	}
+	switch strings.ToLower(args[0]) {
+	case "status":
+		if len(args) == 1 {
+			return llmwCommand{verb: "status"}, true
+		}
+		return llmwCommand{verb: "usage"}, true
+	case "list":
+		if len(args) == 1 {
+			return llmwCommand{verb: "list"}, true
+		}
+		return llmwCommand{verb: "usage"}, true
+	case "enter":
+		if len(args) == 2 {
+			return llmwCommand{verb: "enter", name: args[1]}, true
+		}
+		return llmwCommand{verb: "usage"}, true
+	case "stop":
+		switch len(args) {
+		case 2:
+			return llmwCommand{verb: "stop", name: args[1]}, true
+		case 3:
+			return llmwCommand{verb: "stop", name: args[1], suffix: args[2]}, true
+		}
+		return llmwCommand{verb: "usage"}, true
+	case "wiki":
+		return parseLlmwCLINative(args[1:]), true
+	}
+	return llmwCommand{verb: "usage"}, true
+}
+
+// parseLlmwCLINative parses the tokens after "/llmw wiki" in CLI grammar:
+// --name=X (required), trailing verb enter|stop (required), --window-suffix=Y
+// (optional), --yes/-y (accepted and ignored — always implied on the IM
+// path). Anything else falls back to the usage line.
+func parseLlmwCLINative(tokens []string) llmwCommand {
+	var name, suffix, verb string
+	for _, tok := range tokens {
+		switch {
+		case strings.HasPrefix(tok, "--name="):
+			name = strings.TrimPrefix(tok, "--name=")
+		case strings.HasPrefix(tok, "--window-suffix="):
+			suffix = strings.TrimPrefix(tok, "--window-suffix=")
+		case tok == "--yes" || tok == "-y":
+			// implied: the IM path always runs non-interactive
+		case tok == "enter" || tok == "stop":
+			if verb != "" {
+				return llmwCommand{verb: "usage"}
+			}
+			verb = tok
+		default:
+			return llmwCommand{verb: "usage"}
+		}
+	}
+	if verb == "" || name == "" {
+		return llmwCommand{verb: "usage"}
+	}
+	return llmwCommand{verb: verb, name: name, suffix: suffix}
+}
+
+// renderWindows renders `llmw status --json` rows as an IM text table. State
+// uses llmw's ASCII contract values verbatim (dead / shell / working /
+// waiting / unknown); dead rows show the idle column as "exited <dur> ago".
+func renderWindows(rows []windowRow) string {
+	if len(rows) == 0 {
+		return "当前没有运行中的窗口（llmw status）"
+	}
+	header := []string{"WIKI", "WINDOW", "BACKEND", "STATE", "UPTIME", "IDLE"}
+	cells := make([][]string, 0, len(rows))
+	for _, r := range rows {
+		uptime := "-"
+		if r.UptimeSeconds != nil {
+			uptime = fmtDur(*r.UptimeSeconds)
+		}
+		idle := "-"
+		if r.Dead {
+			if r.DeadSecondsAgo != nil {
+				idle = "exited " + fmtDur(*r.DeadSecondsAgo) + " ago"
+			} else {
+				idle = "exited"
+			}
+		} else if r.IdleSeconds != nil {
+			idle = fmtDur(*r.IdleSeconds)
+		}
+		backend := r.Backend
+		if backend == "" {
+			backend = "-"
+		}
+		state := r.State
+		if state == "" {
+			state = "unknown"
+		}
+		cells = append(cells, []string{r.Wiki, r.Window, backend, state, uptime, idle})
+	}
+	widths := make([]int, len(header))
+	for i, h := range header {
+		widths[i] = len(h)
+	}
+	for _, c := range cells {
+		for i, v := range c {
+			if len(v) > widths[i] {
+				widths[i] = len(v)
+			}
+		}
+	}
+	var b strings.Builder
+	for i, h := range header {
+		b.WriteString(padRight(h, widths[i]))
+		if i < len(header)-1 {
+			b.WriteString("  ")
+		}
+	}
+	for _, c := range cells {
+		b.WriteString("\n")
+		for i, v := range c {
+			b.WriteString(padRight(v, widths[i]))
+			if i < len(c)-1 {
+				b.WriteString("  ")
+			}
+		}
+	}
+	return b.String()
+}
+
+// fmtDur mirrors llmw's duration format (<60s "now"; <60m "Nm"; <24h "Nh";
+// else "Nd") so IM output matches the CLI's status table.
+func fmtDur(seconds float64) string {
+	if seconds < 60 {
+		return "now"
+	}
+	minutes := int(seconds / 60)
+	if minutes < 60 {
+		return strconv.Itoa(minutes) + "m"
+	}
+	hours := int(seconds / 3600)
+	if hours < 24 {
+		return strconv.Itoa(hours) + "h"
+	}
+	return strconv.Itoa(hours/24) + "d"
+}
+
+func padRight(s string, w int) string {
+	for len(s) < w {
+		s += " "
+	}
+	return s
 }
 
 // isNumeric reports whether the prompt is a plain integer.
