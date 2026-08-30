@@ -113,8 +113,10 @@ backend = "opencode"   # 唯一合法值（省略即默认）；写别的值启�
 
 ## 运维
 
-> 部署/安装/配置脚本**不放本仓**（fork 最小分叉面）——归 yzr-agent-tools 的
-> `cc-connect-setup` 工具；在其就绪前，以下手动命令为准。
+> 部署/安装/配置脚本**不放本仓**（fork 最小分叉面）——日常走 yzr-agent-tools 的
+> `cc-connect-mgr` 工具（`install` / `config` / `upgrade` / `uninstall`，
+> 含二进制来源校验、npm 制品安装、systemd 看门狗、secrets 走 0600 env 文件，
+> 详见该工具 README）。以下手动命令仅作工具不可用时的兜底。
 
 **凭据**：bot token 放 `/root/.cc-connect/env`（`chmod 600`）——不要写在命令行里
 （会进 shell history 与 ps）：
