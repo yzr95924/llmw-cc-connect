@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/BurntSushi/toml"
 )
 
 const (
@@ -20,9 +18,10 @@ const (
 	defaultWorkspace    = "yzr-llm-wiki-workspace"
 	listTimeout         = 5 * time.Second
 	enterTimeout        = 15 * time.Second
-	spawnTimeout        = 5 * time.Second
 	pendingSelectionTTL = 60 * time.Second
 	statusTimeout       = 5 * time.Second
+	contextSizeTimeout  = 8 * time.Second  // per live window
+	statusSizeBudget    = 30 * time.Second // whole /llmw status op
 	stopTimeout         = 15 * time.Second
 )
 
@@ -46,20 +45,20 @@ type wikiEntry struct {
 // waiting / unknown; uptime/idle/dead-ago seconds are optional (nil when the
 // tmux markers are missing).
 type windowRow struct {
-	Wiki           string  `json:"wiki"`
-	Window         string  `json:"window"`
-	WindowID       string  `json:"window_id"`
-	Session        string  `json:"session"`
-	Dead           bool    `json:"dead"`
-	StartedAt      *int64  `json:"started_at"`
-	ActivityAt     *int64  `json:"activity_at"`
-	DeadAt         *int64  `json:"dead_at"`
-	Backend        string  `json:"backend"`
-	Pcmd           string  `json:"pcmd"`
+	Wiki           string   `json:"wiki"`
+	Window         string   `json:"window"`
+	WindowID       string   `json:"window_id"`
+	Session        string   `json:"session"`
+	Dead           bool     `json:"dead"`
+	StartedAt      *int64   `json:"started_at"`
+	ActivityAt     *int64   `json:"activity_at"`
+	DeadAt         *int64   `json:"dead_at"`
+	Backend        string   `json:"backend"`
+	Pcmd           string   `json:"pcmd"`
 	UptimeSeconds  *float64 `json:"uptime_seconds"`
 	IdleSeconds    *float64 `json:"idle_seconds"`
 	DeadSecondsAgo *float64 `json:"dead_seconds_ago"`
-	State          string  `json:"state"`
+	State          string   `json:"state"`
 }
 
 // llmwClient shells out to the llmw CLI. run and root are injectable for tests.
@@ -129,34 +128,20 @@ func (c *llmwClient) list(ctx context.Context) ([]wikiEntry, error) {
 	return wikis, nil
 }
 
-// enterWiki runs `llmw wiki --name=<name> enter` (fire-and-forget: byobu mode
-// returns immediately after the window is created/reused; the overlay is
-// refreshed as a side effect). Must only be called when byobu is enabled —
-// linear mode blocks until the agent exits.
-func (c *llmwClient) enterWiki(ctx context.Context, name string) error {
+// enterWiki ensures the wiki's byobu window exists (`llmw wiki enter` is
+// idempotent — reuses a live window, rebuilds a dead one — and daemon-safe:
+// non-TTY callers never attach). suffix "" means the default "main" window.
+func (c *llmwClient) enterWiki(ctx context.Context, name, suffix string) error {
 	ctx, cancel := context.WithTimeout(ctx, enterTimeout)
 	defer cancel()
-	if _, err := c.run(ctx, "wiki", "--name="+name, "enter"); err != nil {
+	args := []string{"wiki", "--name=" + name, "enter"}
+	if suffix != "" && suffix != "main" {
+		args = append(args, "--window-suffix="+suffix)
+	}
+	if _, err := c.run(ctx, args...); err != nil {
 		return err
 	}
 	return nil
-}
-
-// enterByobuEnabled reads workspace_local.toml's enter_byobu flag. A missing
-// file or key means linear mode (enter would block) — callers must skip
-// enterWiki then.
-func (c *llmwClient) enterByobuEnabled() bool {
-	root, err := c.root()
-	if err != nil {
-		return false
-	}
-	var cfg struct {
-		EnterByobu bool `toml:"enter_byobu"`
-	}
-	if _, err := toml.DecodeFile(filepath.Join(root, "workspace_local.toml"), &cfg); err != nil {
-		return false
-	}
-	return cfg.EnterByobu
 }
 
 // status returns the running host windows via `llmw status --json` (design

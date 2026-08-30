@@ -1,17 +1,17 @@
 // Package llmw integrates the llm-workspace-cli (llmw) workspace into
-// cc-connect as a first-class agent.
+// cc-connect as a first-class agent, driving the opencode TUI that llmw
+// manages inside byobu windows (v3 pane driver — opencode is the only
+// supported backend):
 //
-// The agent does not talk to claude/opencode directly: it wraps the existing
-// claudecode and opencode agents from the same repository and delegates all
-// protocol, permission and lifecycle handling to them. What llmw adds is a
-// "policy layer":
-//
-//   - `/wikis` lists the wikis of the current llmw workspace (via `llmw list --json`)
-//   - entering a wiki spawns the wrapped backend agent with cwd = wiki dir,
-//     so the CLI natively reads the model overlay written by llmw
-//     (.claude/settings.local.json for claude, opencode.json for opencode)
-//   - switching wiki closes the old wrapped session and spawns a new one
-//   - the agent session ID encodes the bound wiki ("llmw:<wiki>:<innerID>"),
+//   - `/llmw` lists / enters the wikis of the current llmw workspace (via
+//     `llmw list/status/wiki enter --json`); entering means attaching the
+//     facade to the wiki's byobu window and its opencode TUI pane
+//   - prompts are injected with tmux paste-buffer (bracketed paste keeps
+//     multi-line text intact), turn completion is detected from the pane's
+//     busy marker, and replies are recovered from `opencode export`
+//   - permission dialogs in the TUI surface as IM approval buttons (the
+//     choice is injected back as Left/Right + Enter key presses)
+//   - the agent session ID encodes the bound wiki ("llmw:<wiki>:<pane>"),
 //     so the binding survives cc-connect restarts via the engine's session
 //     persistence.
 package llmw
@@ -24,20 +24,37 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
 
 const (
 	agentName      = "llmw"
-	defaultBackend = "claude"
+	defaultBackend = "opencode"
 	commandsSubdir = "llmw-commands"
 	menuSentinel   = "<llmw:menu>"
 
 	// menuCommand is the content of the /llmw agent command file, written to
 	// the commands dir at New(). First line becomes the command description in
 	// platform menus; the sentinel line lets Send() recognise the expansion.
-	menuCommand = "llmw workspace 窗口与会话管理（status/list/enter/stop）\n<llmw:menu>"
+	// The three subcommand aliases (list/switch/stop) exist because Telegram
+	// menu taps cannot carry arguments; engine /switch and /list are disabled
+	// for llmw (their rebind relies on the implicit resume we removed), so
+	// the /llmw family must be self-sufficient in the command menu.
+	menuCommand          = "llmw 窗口与会话状态总览\n<llmw:menu>"
+	menuCommandLegacyR23 = "llmw workspace 窗口与会话管理（status/list/enter/stop/switch/detach）\n<llmw:menu>"
+	menuCommandLegacy    = "llmw workspace 窗口与会话管理（status/list/enter/stop/switch）\n<llmw:menu>"
+	menuCommandLegacyV1  = "llmw workspace 窗口与会话管理（status/list/enter/stop）\n<llmw:menu>"
+	listMenuCommand      = "列出 workspace 的 wiki（回复序号进入）\n<llmw:menu> list"
+	switchMenuCommand    = "切换到其它主机窗口（回复序号）\n<llmw:menu> switch"
+	stopMenuCommand      = "退出当前绑定的 wiki 窗口（关闭窗口，先确认）\n<llmw:menu> stop"
+	stopMenuCommandV1    = "退出当前绑定的 wiki 窗口\n<llmw:menu> stop"
+	detachMenuCommand    = "解绑当前会话（保留主机窗口）\n<llmw:menu> detach"
+	enterMenuCommand     = "进入 wiki（手敲 /llmw_enter <名> [suffix]）\n<llmw:menu> enter"
+	abortMenuCommand     = "中止当前窗口进行中的回合（发送 ESC）\n<llmw:menu> abort"
+	newMenuCommand       = "开启新会话（当前窗口，旧会话保留可续）\n<llmw:menu> new"
 
 	// legacyWikisCommand is the v2 content of wikis.md (superseded by the
 	// /llmw prefix family, design §7.5). installCommands removes wikis.md
@@ -50,56 +67,87 @@ func init() {
 	core.RegisterAgent(agentName, New)
 }
 
-// llmwAgent implements core.Agent. It wraps a backend agent (claudecode or
-// opencode) per bound wiki and keeps one sessionFacade per engine session ID.
+// llmwAgent implements core.Agent. It keeps one sessionFacade per engine
+// session ID; each facade drives the opencode TUI inside an llmw-managed
+// byobu window (design v3: pane driver, zero headless subprocess).
 type llmwAgent struct {
 	mu          sync.Mutex
-	backend     string
-	baseOpts    map[string]any // forwarded opts with work_dir and model stripped
 	client      *llmwClient
 	sessions    map[string]*sessionFacade
 	commandsDir string
 	ctx         context.Context
 	cancel      context.CancelFunc
+	// mode is the target opencode subagent ("" = "build" | "plan"), stored
+	// atomically: it is read from doEnterLocked under a.mu, so it must not
+	// take the same lock.
+	mode atomic.Value
+	// model is the pending target model id ("provider/model"), same
+	// atomicity rationale as mode: SetModel may run before any facade
+	// exists (the engine allows /model right after startup) and the target
+	// is applied when the next window attaches (doEnterLocked).
+	model atomic.Value
 
-	// innerFactory is injectable for tests. It mirrors the real factory
-	// selection done by newInnerAgent.
-	innerFactory func(opts map[string]any) (core.Agent, error)
+	// paneFactory is injectable for tests. Production builds a paneSession
+	// over the real tmux server and the opencode CLI.
+	paneFactory func(ctx context.Context, target, workDir string) core.AgentSession
+
+	// dataDir is the cc-connect data dir (opts cc_data_dir) where the
+	// /llmw command file is installed.
+	dataDir string
+}
+
+// SetMode stores the target opencode subagent (build/plan). The engine
+// applies it to the running window via LiveModeSwitcher (hot Tab switch in
+// the shared TUI); fresh windows also start in the target mode (doEnterLocked).
+func (a *llmwAgent) SetMode(mode string) {
+	m := normalizePaneMode(mode)
+	a.mode.Store(m)
+	slog.Info(agentName+": mode changed", "mode", m)
+}
+
+// GetMode returns the current target subagent ("build" when unset).
+func (a *llmwAgent) GetMode() string {
+	if m, _ := a.mode.Load().(string); m != "" {
+		return m
+	}
+	return "build"
+}
+
+// PermissionModes implements core.ModeSwitcher: the two built-in opencode
+// subagents. Build is the full-access default; Plan is read-only planning.
+func (a *llmwAgent) PermissionModes() []core.PermissionModeInfo {
+	return []core.PermissionModeInfo{
+		{Key: "build", Name: "Build", NameZh: "构建模式", Desc: "Full tool access (opencode default)", DescZh: "完整工具权限（默认）"},
+		{Key: "plan", Name: "Plan", NameZh: "规划模式", Desc: "Read-only planning, no execution", DescZh: "只读规划，不执行修改"},
+	}
 }
 
 // New implements core.AgentFactory for agent type "llmw".
 //
 // opts keys:
-//   - "backend": "claude" (default) or "opencode" — which wrapped agent to use
-//   - everything else (cc_data_dir, cc_project, mode, ...) is forwarded to the
-//     wrapped agent factory, except "work_dir" and "model" which are stripped:
-//     work_dir is set per wiki, model must come from the llmw overlay (the
-//     CLI reads it natively when cwd is the wiki dir).
+//   - "backend": only "opencode" is accepted (v3 pane driver is
+//     llmw window. v3 drives the in-window TUI; only opencode is wired so far
+//     (claude needs its own state patterns and reply source, see design doc).
+//   - everything else is accepted and ignored (the pane driver needs no
+//     per-backend agent options; the wiki overlay configures the TUI).
 func New(opts map[string]any) (core.Agent, error) {
 	backend, _ := opts["backend"].(string)
 	if backend == "" {
 		backend = defaultBackend
 	}
-	if backend != "claude" && backend != "opencode" {
-		return nil, fmt.Errorf("llmw: unsupported backend %q (supported: claude, opencode)", backend)
-	}
-
-	base := make(map[string]any, len(opts))
-	for k, v := range opts {
-		if k == "work_dir" || k == "model" {
-			continue
-		}
-		base[k] = v
+	if backend != "opencode" {
+		return nil, fmt.Errorf("llmw: unsupported backend %q (v3 pane driver supports: opencode)", backend)
 	}
 
 	a := &llmwAgent{
-		backend:  backend,
-		baseOpts: base,
 		client:   newLlmwClient(),
 		sessions: make(map[string]*sessionFacade),
 	}
+	a.dataDir, _ = opts["cc_data_dir"].(string)
 	a.ctx, a.cancel = context.WithCancel(context.Background())
-	a.innerFactory = a.realInnerFactory
+	a.paneFactory = func(ctx context.Context, target, workDir string) core.AgentSession {
+		return newPaneSession(ctx, &realPaneRunner{target: target, workDir: workDir}, workDir)
+	}
 
 	if err := a.installCommands(); err != nil {
 		slog.Warn("llmw: install commands", "err", err)
@@ -111,7 +159,8 @@ func (a *llmwAgent) Name() string { return agentName }
 
 // StartSession creates or resumes a sessionFacade for the engine session.
 // sessionID may be empty (brand-new session) or a previously persisted
-// "llmw:<wiki>:<innerID>" id, in which case the wiki binding is restored.
+// "llmw:<wiki>:<suffix>" id, in which case the wiki binding is restored
+// (the window itself survives daemon restarts in byobu; re-enter reattaches).
 func (a *llmwAgent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -122,14 +171,15 @@ func (a *llmwAgent) StartSession(ctx context.Context, sessionID string) (core.Ag
 	f := newSessionFacade(a, sessionID)
 	a.sessions[sessionID] = f
 
-	wikiName, innerID, ours := parseFacadeID(sessionID)
-	if ours && wikiName != "" {
-		w, err := a.findWiki(ctx, wikiName)
-		if err != nil {
-			slog.Warn("llmw: resume failed, wiki not found", "wiki", wikiName, "err", err)
-			return f, nil
-		}
-		f.resumeIntoLocked(ctx, w, innerID)
+	// Deliberately NO implicit resume here. cc-connect calls StartSession
+	// identically for post-restart recovery and for engine /switch rebinds,
+	// and the engine's persisted agent_session_id cannot be cleared from the
+	// agent side — so a resume here would resurrect windows the user stopped
+	// and silently re-attach after every daemon restart. Binding is instead
+	// always explicit: the facade starts unbound and the user /llmw enters
+	// (or /llmw switch → number) to attach. See README "重启后绑定作废".
+	if ours := func() bool { _, _, ok := parseFacadeID(sessionID); return ok }(); ours {
+		slog.Info("llmw: session created unbound (explicit enter required)", "id", sessionID)
 	}
 	return f, nil
 }
@@ -141,10 +191,67 @@ func (a *llmwAgent) ValidateSessionID(_ context.Context, id string) bool {
 	return ours
 }
 
-// ListSessions reports no backend-level sessions: sessions are managed by the
-// engine per IM session, so the /list command shows nothing extra for llmw.
-func (a *llmwAgent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
-	return nil, nil
+// ListSessions enumerates the live llmw host windows (llmw status --json) as
+// switchable agent sessions — one per window, id "llmw:<wiki>:<suffix>"
+// (suffix "" = the main window, matching facadeID). This powers /switch and
+// /list: selecting an entry rebinds the IM conversation to that window via
+// StartSession's resume path (doEnterLocked reattaches globally). Dead
+// remain-on-exit rows and status errors yield an empty list rather than a
+// broken /switch card.
+func (a *llmwAgent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
+	rows, err := a.client.status(ctx)
+	if err != nil {
+		slog.Warn(agentName+": status for /switch", "err", err)
+		return nil, nil
+	}
+	var out []core.AgentSessionInfo
+	for i := range rows {
+		r := &rows[i]
+		if r.Dead || r.Wiki == "" || r.Window == "" {
+			continue
+		}
+		// The window name is "<wiki>-<suffix>"; the row's own Wiki field
+		// disambiguates hyphenated wiki names.
+		suffix, ok := windowSuffix(r.Wiki, r.Window)
+		if !ok {
+			continue
+		}
+		summary := r.Wiki
+		if suffix != "" && suffix != "main" {
+			summary += " (" + suffix + ")"
+		}
+		if r.State != "" {
+			summary += " · " + r.State
+		}
+		var mod time.Time
+		if r.ActivityAt != nil {
+			mod = time.Unix(*r.ActivityAt, 0)
+		}
+		out = append(out, core.AgentSessionInfo{
+			ID:         facadeID(r.Wiki, suffix),
+			Summary:    summary,
+			ModifiedAt: mod,
+		})
+	}
+	return out, nil
+}
+
+// windowSuffix extracts the suffix from "<wiki>-<suffix>", mapping the main
+// window back to "" (the canonical facade id for main is "llmw:<wiki>:").
+// ok=false when the window does not belong to the wiki at all.
+func windowSuffix(wiki, window string) (string, bool) {
+	prefix := wiki + "-"
+	if !strings.HasPrefix(window, prefix) {
+		if window == wiki {
+			return "", true
+		}
+		return "", false
+	}
+	suffix := strings.TrimPrefix(window, prefix)
+	if suffix == "main" {
+		return "", true
+	}
+	return suffix, true
 }
 
 func (a *llmwAgent) Stop() error {
@@ -158,7 +265,9 @@ func (a *llmwAgent) Stop() error {
 	a.cancel()
 	var errs []error
 	for _, f := range all {
-		if err := f.closeLocked(); err != nil {
+		// f.Close takes f.mu — closeLocked must never be called unlocked
+		// (Send may be inside f.inner.Send under f.mu concurrently).
+		if err := f.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -192,7 +301,7 @@ func (a *llmwAgent) CommandDirs() []string {
 // removes the superseded v2 wikis.md when it still holds the agent-generated
 // constant (hard cutover, design §7.5).
 func (a *llmwAgent) installCommands() error {
-	dataDir, _ := a.baseOpts["cc_data_dir"].(string)
+	dataDir := a.dataDir
 	if dataDir == "" {
 		cfgDir, err := os.UserConfigDir()
 		if err != nil {
@@ -204,14 +313,58 @@ func (a *llmwAgent) installCommands() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("llmw: mkdir commands dir: %w", err)
 	}
-	path := filepath.Join(dir, "llmw.md")
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.WriteFile(path, []byte(menuCommand), 0o644); err != nil {
-			return fmt.Errorf("llmw: write llmw.md: %w", err)
+	menuFiles := []struct {
+		name    string
+		current string
+		legacy  []string
+	}{
+		{"llmw.md", menuCommand, []string{menuCommandLegacyR23, menuCommandLegacy, menuCommandLegacyV1}},
+		{"llmw_list.md", listMenuCommand, nil},
+		{"llmw_switch.md", switchMenuCommand, nil},
+		{"llmw_stop.md", stopMenuCommand, []string{stopMenuCommandV1}},
+		{"llmw_detach.md", detachMenuCommand, nil},
+		{"llmw_enter.md", enterMenuCommand, nil},
+		{"llmw_abort.md", abortMenuCommand, nil},
+		{"llmw_new.md", newMenuCommand, nil},
+	}
+	for _, mf := range menuFiles {
+		if err := a.installCommandFile(filepath.Join(dir, mf.name), mf.current, mf.legacy); err != nil {
+			return err
 		}
 	}
 	a.cleanupLegacyWikisCommand(dir)
 	a.commandsDir = dir
+	return nil
+}
+
+// installCommandFile writes a menu command template: create when absent,
+// refresh when the file still holds a known agent-generated version (so
+// description updates propagate), keep with a warning when user-modified.
+func (a *llmwAgent) installCommandFile(path, current string, legacy []string) error {
+	data, err := os.ReadFile(path)
+	switch {
+	case os.IsNotExist(err):
+		if err := os.WriteFile(path, []byte(current), 0o644); err != nil {
+			return fmt.Errorf("llmw: write %s: %w", filepath.Base(path), err)
+		}
+		return nil
+	case err != nil:
+		return fmt.Errorf("llmw: read %s: %w", filepath.Base(path), err)
+	}
+	switch string(data) {
+	case current:
+		return nil
+	default:
+		for _, old := range legacy {
+			if string(data) == old {
+				if err := os.WriteFile(path, []byte(current), 0o644); err != nil {
+					return fmt.Errorf("llmw: refresh %s: %w", filepath.Base(path), err)
+				}
+				return nil
+			}
+		}
+	}
+	slog.Warn("llmw: menu command kept (user-modified)", "path", path)
 	return nil
 }
 
@@ -234,34 +387,9 @@ func (a *llmwAgent) cleanupLegacyWikisCommand(dir string) {
 	slog.Warn("llmw: legacy wikis.md kept (user-modified); /wikis no longer advertised, remove manually if unwanted", "path", path)
 }
 
-// realInnerFactory builds the wrapped backend agent via the core registry
-// instead of importing the agent packages directly. This keeps agent/llmw
-// compile-decoupled from the actively-developed claudecode/opencode packages
-// (their New signatures can change without breaking us) and honours build
-// exclusion: with EXCLUDE=claudecode the backend is genuinely absent and
-// StartSession fails with a clear "unknown agent" error instead of silently
-// pulling the excluded package back into the binary.
-func (a *llmwAgent) realInnerFactory(opts map[string]any) (core.Agent, error) {
-	name := a.backend
-	if name == "claude" {
-		name = "claudecode" // config name → registry name
-	}
-	return core.CreateAgent(name, opts)
-}
-
-// newInnerAgent returns a wrapped backend agent whose work_dir is the given wiki.
-func (a *llmwAgent) newInnerAgent(w *wikiEntry) (core.Agent, error) {
-	root, err := a.client.workspaceRoot()
-	if err != nil {
-		return nil, err
-	}
-	opts := make(map[string]any, len(a.baseOpts)+1)
-	for k, v := range a.baseOpts {
-		opts[k] = v
-	}
-	opts["work_dir"] = filepath.Join(root, w.Path)
-	return a.innerFactory(opts)
-}
+// newInnerAgent 的子进程实现已随 v3 pane driver 删除：
+// inner 会话现在由 facade 直接构造 paneSession（见 doEnterLocked），
+// 不再经 core agent registry 包装 headless CLI。
 
 // findWiki resolves a wiki by name or display_name (exact or case-insensitive).
 func (a *llmwAgent) findWiki(ctx context.Context, name string) (*wikiEntry, error) {
@@ -297,4 +425,90 @@ func parseFacadeID(id string) (wiki, innerID string, ours bool) {
 		innerID = parts[2]
 	}
 	return wiki, innerID, true
+}
+
+// modelsListFn lists "provider/model" ids from the GLOBAL opencode config
+// (neutral workdir: wiki overlays must not leak into the list). Swappable
+// for tests.
+var modelsListFn = func(ctx context.Context) (string, error) {
+	return runOpencodeDir(ctx, "", "models")
+}
+
+// AvailableModels implements core.ModelSwitcher: the /model command lists
+// these and routes the chosen one back through SetModel.
+func (a *llmwAgent) AvailableModels(ctx context.Context) []core.ModelOption {
+	raw, err := modelsListFn(ctx)
+	if err != nil {
+		slog.Warn("llmw: opencode models", "err", err)
+		return nil
+	}
+	seen := map[string]bool{}
+	var opts []core.ModelOption
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || seen[line] {
+			continue
+		}
+		// Only the yzr* providers: they are the ones the llmw overlay
+		// actually configures — the builtin opencode catalogs (128 models)
+		// are noise for this workspace.
+		if provider, _ := splitModelID(line); !strings.HasPrefix(provider, "yzr") {
+			continue
+		}
+		seen[line] = true
+		opts = append(opts, core.ModelOption{Name: line})
+	}
+	return opts
+}
+
+// SetModel implements core.ModelSwitcher. Unlike headless agents (effect on
+// next spawn), the pane driver switches the LIVE window immediately; when
+// no window is attached yet the target is stored and applied on the next
+// doEnterLocked (2026-08-30: a /model right after startup silently no-opped
+// otherwise). The interface has no error channel, so live-switch failures
+// are logged; the next /model re-reads the bar via GetModel and
+// self-corrects.
+func (a *llmwAgent) SetModel(model string) {
+	if model != "" {
+		a.model.Store(model)
+	}
+	for _, f := range a.facades() {
+		if err := f.SetLiveModel(model); err != nil {
+			slog.Warn("llmw: live model switch", "model", model, "err", err)
+		}
+	}
+}
+
+// CompressCommand implements core.ContextCompressor: the engine's /compress
+// (and auto-compress) forwards this TUI command through session.Send; the
+// pane driver runs the compaction lifecycle without reply extraction.
+func (a *llmwAgent) CompressCommand() string { return compactCmd }
+
+// TargetModel returns the stored model target ("" = overlay default).
+func (a *llmwAgent) TargetModel() string {
+	if m, _ := a.model.Load().(string); m != "" {
+		return m
+	}
+	return ""
+}
+
+// GetModel reports the first live window's current model ("" when no
+// window is entered).
+func (a *llmwAgent) GetModel() string {
+	for _, f := range a.facades() {
+		if m := f.GetLiveModel(); m != "" {
+			return m
+		}
+	}
+	return a.TargetModel()
+}
+
+func (a *llmwAgent) facades() []*sessionFacade {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]*sessionFacade, 0, len(a.sessions))
+	for _, f := range a.sessions {
+		out = append(out, f)
+	}
+	return out
 }

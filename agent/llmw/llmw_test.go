@@ -75,23 +75,32 @@ func TestLlmwClientListBadJSON(t *testing.T) {
 }
 
 func TestLlmwClientEnterWikiArgs(t *testing.T) {
-	var got []string
+	var got [][]string
 	c := newLlmwClient()
 	c.run = func(_ context.Context, args ...string) ([]byte, error) {
-		got = args
+		got = append(got, args)
 		return []byte{}, nil
 	}
 
-	if err := c.enterWiki(context.Background(), "kv-store"); err != nil {
+	if err := c.enterWiki(context.Background(), "kv-store", ""); err != nil {
 		t.Fatalf("enterWiki: %v", err)
 	}
-	want := []string{"wiki", "--name=kv-store", "enter"}
-	if len(got) != len(want) {
-		t.Fatalf("args = %v, want %v", got, want)
+	if err := c.enterWiki(context.Background(), "kv-store", "ingest"); err != nil {
+		t.Fatalf("enterWiki with suffix: %v", err)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("args = %v, want %v", got, want)
+	wantMain := []string{"wiki", "--name=kv-store", "enter"}
+	wantSfx := []string{"wiki", "--name=kv-store", "enter", "--window-suffix=ingest"}
+	if len(got) != 2 {
+		t.Fatalf("calls = %v", got)
+	}
+	for i := range wantMain {
+		if got[0][i] != wantMain[i] {
+			t.Fatalf("main args = %v, want %v", got[0], wantMain)
+		}
+	}
+	for i := range wantSfx {
+		if got[1][i] != wantSfx[i] {
+			t.Fatalf("suffix args = %v, want %v", got[1], wantSfx)
 		}
 	}
 }
@@ -128,36 +137,6 @@ func TestLlmwClientDefaultWorkspace(t *testing.T) {
 		}
 	}
 	_ = home
-}
-
-func TestLlmwClientEnterByobuEnabled(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("LLMW_WORKSPACE", dir)
-	if err := os.WriteFile(filepath.Join(dir, "workspace.toml"), []byte("# t"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	c := newLlmwClient()
-
-	// Missing file → false.
-	if c.enterByobuEnabled() {
-		t.Fatal("want false for missing workspace_local.toml")
-	}
-	// Key present without value → false.
-	if err := os.WriteFile(filepath.Join(dir, "workspace_local.toml"),
-		[]byte("schema_version = 1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if c.enterByobuEnabled() {
-		t.Fatal("want false when enter_byobu absent")
-	}
-	// enter_byobu = true → true.
-	if err := os.WriteFile(filepath.Join(dir, "workspace_local.toml"),
-		[]byte("schema_version = 1\nenter_byobu = true\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !c.enterByobuEnabled() {
-		t.Fatal("want true when enter_byobu = true")
-	}
 }
 
 func TestWikiMatch(t *testing.T) {
@@ -221,38 +200,6 @@ func TestRegistrationAndValidate(t *testing.T) {
 	}
 }
 
-func TestRealInnerFactoryMapping(t *testing.T) {
-	// Register throwaway factories under the real registry names to observe
-	// the mapping without importing the actual agent packages (agent/llmw is
-	// deliberately decoupled from them; the smoke binary registers the real
-	// ones via blank imports).
-	var got []string
-	core.RegisterAgent("claudecode", func(opts map[string]any) (core.Agent, error) {
-		got = append(got, "claudecode")
-		return &fakeInnerAgent{}, nil
-	})
-	core.RegisterAgent("opencode", func(opts map[string]any) (core.Agent, error) {
-		got = append(got, "opencode")
-		return &fakeInnerAgent{}, nil
-	})
-
-	for backend, want := range map[string]string{"claude": "claudecode", "opencode": "opencode"} {
-		a := &llmwAgent{backend: backend}
-		if _, err := a.realInnerFactory(map[string]any{}); err != nil {
-			t.Fatalf("backend %s: %v", backend, err)
-		}
-		if len(got) == 0 || got[len(got)-1] != want {
-			t.Errorf("backend %q should create registry agent %q, got %v", backend, want, got)
-		}
-	}
-
-	// Unknown backend surfaces the registry error explicitly.
-	a := &llmwAgent{backend: "nope"}
-	if _, err := a.realInnerFactory(map[string]any{}); err == nil {
-		t.Error("unknown backend must fail via registry lookup")
-	}
-}
-
 func TestNew(t *testing.T) {
 	// Bad backend.
 	if _, err := New(map[string]any{"backend": "nope"}); err == nil {
@@ -264,8 +211,8 @@ func TestNew(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	ag := a.(*llmwAgent)
-	if ag.backend != defaultBackend {
-		t.Fatalf("backend = %q, want %q", ag.backend, defaultBackend)
+	if ag.client == nil || ag.sessions == nil {
+		t.Fatal("agent must own a client and facade map")
 	}
 	// Command dir installed with llmw.md.
 	md := filepath.Join(ag.commandsDir, "llmw.md")
@@ -330,28 +277,6 @@ func TestInstallCommandsCleansLegacyWikis(t *testing.T) {
 	}
 }
 
-func TestNewStripsModelAndWorkDir(t *testing.T) {
-	a, err := New(map[string]any{
-		"model":       "claude-opus-4-7",
-		"work_dir":    "/tmp/whatever",
-		"mode":        "default",
-		"cc_data_dir": t.TempDir(),
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	ag := a.(*llmwAgent)
-	if _, ok := ag.baseOpts["model"]; ok {
-		t.Fatal("model must be stripped")
-	}
-	if _, ok := ag.baseOpts["work_dir"]; ok {
-		t.Fatal("work_dir must be stripped")
-	}
-	if ag.baseOpts["mode"] != "default" {
-		t.Fatalf("mode must be forwarded, got %v", ag.baseOpts["mode"])
-	}
-}
-
 func TestParseLlmwCommand(t *testing.T) {
 	cases := []struct {
 		prompt string
@@ -361,33 +286,46 @@ func TestParseLlmwCommand(t *testing.T) {
 		// Menu sentinel → status.
 		{"<llmw:menu>", true, llmwCommand{verb: "status"}},
 		{"llmw workspace 管理\n<llmw:menu>", true, llmwCommand{verb: "status"}},
-		// Bare + short forms.
-		{"/llmw", true, llmwCommand{verb: "status"}},
-		{"/llmw status", true, llmwCommand{verb: "status"}},
-		{"/llmw list", true, llmwCommand{verb: "list"}},
-		{"/llmw enter foo", true, llmwCommand{verb: "enter", name: "foo"}},
-		{"/llmw stop foo", true, llmwCommand{verb: "stop", name: "foo"}},
-		{"/llmw stop foo ingest", true, llmwCommand{verb: "stop", name: "foo", suffix: "ingest"}},
+		// Template path (hard cutover): verbs arrive after the sentinel,
+		// either baked into the /llmw_xxx template or appended by ExpandPrompt.
+		{"llmw workspace 管理\n<llmw:menu>\n\nlist", true, llmwCommand{verb: "list"}},
+		{"llmw workspace 管理\n<llmw:menu>\n\nenter foo", true, llmwCommand{verb: "enter", name: "foo"}},
+		{"llmw workspace 管理\n<llmw:menu> enter", true, llmwCommand{verb: "list"}}, // menu tap, no args
+		{"llmw workspace 管理\n<llmw:menu> enter foo", true, llmwCommand{verb: "enter", name: "foo"}},
+		{"llmw workspace 管理\n<llmw:menu> enter foo ingest", true, llmwCommand{verb: "enter", name: "foo", suffix: "ingest"}},
+		{"llmw workspace 管理\n<llmw:menu> stop", true, llmwCommand{verb: "stop"}},
+		{"llmw workspace 管理\n<llmw:menu> stop foo", true, llmwCommand{verb: "stop", name: "foo"}},
+		{"llmw workspace 管理\n<llmw:menu> stop foo ingest", true, llmwCommand{verb: "stop", name: "foo", suffix: "ingest"}},
+		{"llmw workspace 管理\n<llmw:menu> switch", true, llmwCommand{verb: "switch"}},
+		{"llmw workspace 管理\n<llmw:menu> detach", true, llmwCommand{verb: "detach"}},
+		{"llmw workspace 管理\n<llmw:menu> abort", true, llmwCommand{verb: "abort"}},
+		{"llmw workspace 管理\n<llmw:menu> abort now", true, llmwCommand{verb: "usage"}},
+		{"llmw workspace 管理\n<llmw:menu> new", true, llmwCommand{verb: "new"}},
+		{"llmw workspace 管理\n<llmw:menu> new foo", true, llmwCommand{verb: "usage"}},
 		// Case-insensitive command word; name keeps case (findWiki is CI).
-		{"/LLMW List", true, llmwCommand{verb: "list"}},
-		{"/llmw enter Foo-Bar", true, llmwCommand{verb: "enter", name: "Foo-Bar"}},
-		// CLI-native form.
-		{"/llmw wiki --name=foo enter", true, llmwCommand{verb: "enter", name: "foo"}},
-		{"/llmw wiki --name=foo stop", true, llmwCommand{verb: "stop", name: "foo"}},
-		{"/llmw wiki --name=foo stop --window-suffix=ing --yes", true, llmwCommand{verb: "stop", name: "foo", suffix: "ing"}},
-		{"/llmw wiki stop --name=foo -y", true, llmwCommand{verb: "stop", name: "foo"}},
-		// Syntax errors still consume the prompt → usage verb.
-		{"/llmw bogus", true, llmwCommand{verb: "usage"}},
-		{"/llmw status extra", true, llmwCommand{verb: "usage"}},
-		{"/llmw enter", true, llmwCommand{verb: "usage"}},
-		{"/llmw stop", true, llmwCommand{verb: "usage"}},
-		{"/llmw wiki", true, llmwCommand{verb: "usage"}},
-		{"/llmw wiki --name=foo", true, llmwCommand{verb: "usage"}},
-		{"/llmw wiki --name=foo show", true, llmwCommand{verb: "usage"}},
-		{"/llmw wiki --name=foo enter --dry-run", true, llmwCommand{verb: "usage"}},
+		{"llmw workspace 管理\n<llmw:menu> List", true, llmwCommand{verb: "list"}},
+		{"llmw workspace 管理\n<llmw:menu> enter Foo-Bar", true, llmwCommand{verb: "enter", name: "Foo-Bar"}},
+		// Typed: bare /llmw is the ONLY accepted form (= status); every
+		// subcommand form is redirected (hard cutover to /llmw_xxx).
+		{"/llmw", true, llmwCommand{verb: "status"}},
+		{"/llmw status", true, llmwCommand{verb: "moved"}},
+		{"/llmw list", true, llmwCommand{verb: "moved"}},
+		{"/llmw enter foo", true, llmwCommand{verb: "moved"}},
+		{"/llmw stop foo", true, llmwCommand{verb: "moved"}},
+		{"/llmw switch", true, llmwCommand{verb: "moved"}},
+		{"/llmw detach", true, llmwCommand{verb: "moved"}},
+		{"/llmw wiki --name=foo enter", true, llmwCommand{verb: "moved"}},
+		{"/LLMW List", true, llmwCommand{verb: "moved"}},
+		// Template-path syntax errors still consume the prompt → usage verb.
+		{"llmw workspace 管理\n<llmw:menu> bogus", true, llmwCommand{verb: "usage"}},
+		{"llmw workspace 管理\n<llmw:menu> status extra", true, llmwCommand{verb: "usage"}},
+		{"llmw workspace 管理\n<llmw:menu> stop foo ing extra", true, llmwCommand{verb: "usage"}},
+		{"llmw workspace 管理\n<llmw:menu> switch foo", true, llmwCommand{verb: "usage"}},
+		{"llmw workspace 管理\n<llmw:menu> wiki --name=foo enter", true, llmwCommand{verb: "usage"}},
 		// Strict boundary: not llmw commands.
 		{"/llmwx", false, llmwCommand{}},
 		{"/llmwlist", false, llmwCommand{}},
+		{"/llmw_stop", false, llmwCommand{}}, // routed to the llmw_stop custom command, not this parser
 		{"/wikis", false, llmwCommand{}},
 		{"/enter foo", false, llmwCommand{}},
 		{"hello world", false, llmwCommand{}},
@@ -515,21 +453,64 @@ func TestLlmwClientStopWikiErrorPassthrough(t *testing.T) {
 
 func TestRenderWindows(t *testing.T) {
 	// Empty table.
-	if s := renderWindows(nil); !strings.Contains(s, "没有运行中的窗口") {
+	if s := renderWindows(nil, nil); !strings.Contains(s, "没有运行中的窗口") {
 		t.Fatalf("empty render = %q", s)
 	}
-	// Table with alive + dead rows.
+	// Table with alive + dead rows + context column.
 	rows := []windowRow{
 		{Wiki: "foo", Window: "foo-main", Backend: "claude", State: "working",
 			UptimeSeconds: ptrFloat(3700), IdleSeconds: ptrFloat(30)},
 		{Wiki: "bar", Window: "bar-ingest", Backend: "opencode", State: "dead",
 			Dead: true, DeadSecondsAgo: ptrFloat(2 * 86400)},
+		{Wiki: "baz", Window: "baz-main", Backend: "opencode", State: "waiting"},
 	}
-	s := renderWindows(rows)
-	for _, want := range []string{"WIKI", "foo-main", "working", "1h", "exited 2d ago", "dead"} {
+	s := renderWindows(rows, map[string]int{"foo-main": 48941})
+	for _, want := range []string{
+		"窗口", "上下文", "foo (foo-main)", "working", "~48.9k", "1h", "exited 2d ago",
+		"dead", "bar (bar-ingest)", "| - |", "baz (baz-main)", "| … |",
+	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("render missing %q:\n%s", want, s)
 		}
+	}
+}
+
+// Context-size extraction: total wins, zero-token rows are skipped, and the
+// fallback sums input+cache when total is absent.
+func TestContextSizeFromExport(t *testing.T) {
+	var e ocExport
+	e.Messages = append(e.Messages, ocMessage{})
+	e.Messages[0].Info.Role = "user"
+	e.Messages[0].Parts = []ocPart{{Type: "text", Text: "hi"}}
+	mk := func(role string, total, in, read int) ocMessage {
+		m := ocMessage{}
+		m.Info.Role = role
+		m.Info.Tokens.Total = total
+		m.Info.Tokens.Input = in
+		m.Info.Tokens.Cache.Read = read
+		return m
+	}
+	e.Messages = append(e.Messages, mk("assistant", 0, 0, 0)) // mid-turn zeros
+	e.Messages = append(e.Messages, mk("assistant", 48941, 386, 48384))
+	raw := marshalExport(t, e)
+	n, err := contextSizeFromExport(raw)
+	if err != nil || n != 48941 {
+		t.Fatalf("contextSizeFromExport = (%d, %v), want (48941, nil)", n, err)
+	}
+
+	// No total → input + cache.read fallback.
+	e2 := ocExport{}
+	e2.Messages = append(e2.Messages, mk("assistant", 0, 386, 48384))
+	n, err = contextSizeFromExport(marshalExport(t, e2))
+	if err != nil || n != 48770 {
+		t.Fatalf("fallback = (%d, %v), want (386+48384=48770, nil)", n, err)
+	}
+
+	// No assistant token data at all → error.
+	e3 := ocExport{}
+	e3.Messages = append(e3.Messages, mk("user", 1, 1, 1))
+	if _, err := contextSizeFromExport(marshalExport(t, e3)); err == nil {
+		t.Fatal("expected error with no assistant tokens")
 	}
 }
 
@@ -548,3 +529,277 @@ func TestFmtDur(t *testing.T) {
 }
 
 func ptrFloat(v float64) *float64 { return &v }
+
+func TestLlmwAgentModeSwitcher(t *testing.T) {
+	a, _, _ := newTestAgent(t)
+
+	if got := a.GetMode(); got != "build" {
+		t.Fatalf("default mode = %q, want build", got)
+	}
+	a.SetMode("plan")
+	if got := a.GetMode(); got != "plan" {
+		t.Fatalf("mode after SetMode(plan) = %q", got)
+	}
+	// Unknown keys normalize to build, mirroring the other agents.
+	a.SetMode("turbo")
+	if got := a.GetMode(); got != "build" {
+		t.Fatalf("mode after SetMode(turbo) = %q, want build fallback", got)
+	}
+
+	modes := a.PermissionModes()
+	if len(modes) != 2 || modes[0].Key != "build" || modes[1].Key != "plan" {
+		t.Fatalf("PermissionModes = %+v, want build+plan", modes)
+	}
+}
+
+// The facade must delegate SetLiveMode to the attached pane session and
+// return false when nothing is attached.
+func TestFacadeSetLiveModeDelegation(t *testing.T) {
+	a, _, runners := newTestAgent(t)
+	f := newSessionFacade(a, "llmw:w:main")
+
+	if f.SetLiveMode("plan") {
+		t.Fatal("no window attached — must return false")
+	}
+
+	r := &fakePaneRunner{workDir: "/ws/foo"}
+	r.mu.Lock()
+	r.uiMode = "build"
+	r.mu.Unlock()
+	ps := newPaneSession(a.ctx, r, "/ws/foo")
+	defer func() { _ = ps.Close() }()
+	f.inner = ps
+
+	if !f.SetLiveMode("plan") {
+		t.Fatal("delegation to a live pane session must succeed")
+	}
+	if got := r.sentKeysLen(); got != 1 {
+		t.Fatalf("sent keys = %d, want 1 Tab", got)
+	}
+	_ = runners
+}
+
+func TestLlmwAgentModelSwitcher(t *testing.T) {
+	old := modelsListFn
+	modelsListFn = func(context.Context) (string, error) {
+		return "yzr-a/m1\nyzr-b/m2\nopencode-go/glm-5.3\n\nyzr-a/m1\n", nil
+	}
+	t.Cleanup(func() { modelsListFn = old })
+
+	a, err := New(map[string]any{"cc_data_dir": t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ag := a.(*llmwAgent)
+
+	models := ag.AvailableModels(context.Background())
+	if len(models) != 2 || models[0].Name != "yzr-a/m1" || models[1].Name != "yzr-b/m2" {
+		t.Fatalf("models = %+v, want yzr-only deduped [yzr-a/m1 yzr-b/m2]", models)
+	}
+	// No live window: SetModel must not panic; the target becomes the
+	// pending model reported by GetModel (applied on next window enter).
+	ag.SetModel("p1/m1")
+	if got := ag.GetModel(); got != "p1/m1" {
+		t.Fatalf("GetModel = %q, want pending target p1/m1", got)
+	}
+}
+
+// A /model switch before any window exists must be remembered and applied
+// when the next window attaches (2026-08-30: it silently no-opped instead).
+func TestLlmwAgentPendingModel(t *testing.T) {
+	a, err := New(map[string]any{"cc_data_dir": t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ag := a.(*llmwAgent)
+	ag.SetModel("yzr-x/m1")
+	if got := ag.TargetModel(); got != "yzr-x/m1" {
+		t.Fatalf("TargetModel = %q, want yzr-x/m1", got)
+	}
+	if got := ag.GetModel(); got != "yzr-x/m1" {
+		t.Fatalf("GetModel = %q, want pending target as fallback", got)
+	}
+}
+
+// doEnterLocked aligns a fresh window with the pending model target.
+func TestFacadeEnterAppliesPendingModel(t *testing.T) {
+	a, _, panes := newTestAgent(t)
+	a.SetModel("yzr-x/m1")
+
+	f := newSessionFacade(a, "llmw:w:main")
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("enter: %v", err)
+	}
+	waitResult(t, f.Events(), 5*time.Second)
+
+	// The pane runner is created lazily by the enter itself; the pending
+	// model must have driven the switch attempt on it (the default fake
+	// capture never shows a "Select model" dialog, so the attempt aborts
+	// with Escape after the wait timeout — proving the alignment ran).
+	var fr *fakePaneRunner
+	for _, r := range panes {
+		fr = r
+		break
+	}
+	if fr == nil {
+		t.Fatal("no fake pane runner was created by the enter")
+	}
+	fr.mu.Lock()
+	keys := append([]string(nil), fr.sentKeys...)
+	texts := append([]string(nil), fr.sentTexts...)
+	fr.mu.Unlock()
+	want := []string{"C-x", "m", "Escape"}
+	if len(keys) != len(want) {
+		t.Fatalf("keys = %v, want %v (switch attempted then aborted)", keys, want)
+	}
+	for i := range keys {
+		if keys[i] != want[i] {
+			t.Fatalf("keys = %v, want %v", keys, want)
+		}
+	}
+	// The fake pane never renders a model dialog, so the driver aborts
+	// right after opening it — no search text is ever typed.
+	if len(texts) != 0 {
+		t.Fatalf("texts = %v, want none (dialog never opened)", texts)
+	}
+}
+
+// ListSessions maps live llmw windows to switchable agent sessions: the
+// main window becomes the canonical "llmw:<wiki>:" id (empty suffix), other
+// suffixes keep their own ids, and dead/malformed rows are skipped.
+func TestLlmwListSessions(t *testing.T) {
+	a, runner, _ := newTestAgent(t)
+	runner.mu.Lock()
+	runner.windows = []windowRow{
+		{Wiki: "agent-tools", Window: "agent-tools-main", Session: "1", State: "working", ActivityAt: int64ptr(1690000000)},
+		{Wiki: "agent-tools", Window: "agent-tools-tg", Session: "1", State: "waiting", ActivityAt: int64ptr(1690000100)},
+		{Wiki: "bar", Window: "bar-main", Session: "2", Dead: true},
+		{Wiki: "foo", Window: "other-window", Session: "3"},
+	}
+	runner.mu.Unlock()
+
+	got, err := a.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("sessions = %+v, want 2 entries", got)
+	}
+	if got[0].ID != "llmw:agent-tools:" || got[0].Summary != "agent-tools · working" {
+		t.Fatalf("entry0 = %+v, want id llmw:agent-tools: summary 'agent-tools · working'", got[0])
+	}
+	if got[1].ID != "llmw:agent-tools:tg" || got[1].Summary != "agent-tools (tg) · waiting" {
+		t.Fatalf("entry1 = %+v, want id llmw:agent-tools:tg summary 'agent-tools (tg) · waiting'", got[1])
+	}
+	if !got[1].ModifiedAt.Equal(time.Unix(1690000100, 0)) {
+		t.Fatalf("entry1 ModifiedAt = %v, want from ActivityAt", got[1].ModifiedAt)
+	}
+
+	// Status errors must not break the /switch card.
+	runner.mu.Lock()
+	runner.errFor = map[string]string{"status": "boom"}
+	runner.mu.Unlock()
+	if got, err := a.ListSessions(context.Background()); err != nil || got != nil {
+		t.Fatalf("ListSessions on status error = (%v, %v), want (nil, nil)", got, err)
+	}
+}
+
+func int64ptr(v int64) *int64 { return &v }
+
+// StartSession on a /switch-produced id ("llmw:<wiki>:<suffix>") must
+// reattach the facade to that wiki's window (the /switch round-trip).
+// Post-restart (or engine /switch) StartSession must NOT implicitly resume:
+// the facade is created unbound even when the named window is live, so
+// binding is always explicit (/llmw enter / /llmw switch). Regression guard
+// for the "stopped window resurrects after daemon restart" bug.
+func TestStartSessionUnboundNoImplicitResume(t *testing.T) {
+	a, runner, panes := newTestAgent(t)
+	runner.mu.Lock()
+	runner.windows = []windowRow{
+		{Wiki: "foo", Window: "foo-tg", WindowID: "@foo1", Session: "llm_workspace", Backend: "opencode", State: "waiting"},
+	}
+	runner.mu.Unlock()
+
+	sess, err := a.StartSession(context.Background(), "llmw:foo:tg")
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	f, ok := sess.(*sessionFacade)
+	if !ok {
+		t.Fatalf("StartSession returned %T", sess)
+	}
+	if got := f.CurrentSessionID(); got != "llmw:foo:tg" {
+		t.Fatalf("facade id = %q, want llmw:foo:tg", got)
+	}
+	if panes["foo"] != nil {
+		t.Fatal("implicit resume spawned a pane; facade must start unbound")
+	}
+	f.mu.Lock()
+	bound := f.wiki != nil
+	f.mu.Unlock()
+	if bound {
+		t.Fatal("facade must be unbound after StartSession; use /llmw enter")
+	}
+}
+
+// installCommandFiles: the four menu templates self-install, idempotently
+// refresh a known-legacy llmw.md, and keep user-modified files with a warning.
+func TestInstallCommandFiles(t *testing.T) {
+	a := &llmwAgent{dataDir: t.TempDir()}
+	if err := a.installCommands(); err != nil {
+		t.Fatalf("installCommands: %v", err)
+	}
+	dir := a.commandsDir
+	for name, want := range map[string]string{
+		"llmw.md":        menuCommand,
+		"llmw_list.md":   listMenuCommand,
+		"llmw_switch.md": switchMenuCommand,
+		"llmw_stop.md":   stopMenuCommand,
+		"llmw_detach.md": detachMenuCommand,
+		"llmw_enter.md":  enterMenuCommand,
+		"llmw_abort.md":  abortMenuCommand,
+		"llmw_new.md":    newMenuCommand,
+	} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+		if string(data) != want {
+			t.Fatalf("%s content drifted: got %q want %q", name, data, want)
+		}
+	}
+	// Legacy llmw.md (pre-switch description) is refreshed in place.
+	if err := os.WriteFile(filepath.Join(dir, "llmw.md"), []byte(menuCommandLegacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.installCommands(); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "llmw.md"))
+	if string(data) != menuCommand {
+		t.Fatalf("legacy llmw.md not refreshed: %q", data)
+	}
+	// User-modified file is preserved.
+	custom := "my own desc\n<llmw:menu> list"
+	if err := os.WriteFile(filepath.Join(dir, "llmw_list.md"), []byte(custom), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.installCommands(); err != nil {
+		t.Fatalf("reinstall 2: %v", err)
+	}
+	data, _ = os.ReadFile(filepath.Join(dir, "llmw_list.md"))
+	if string(data) != custom {
+		t.Fatalf("user-modified llmw_list.md must be kept: %q", data)
+	}
+}
+
+// CompressCommand wires the engine's /compress to the opencode TUI compact.
+func TestLlmwAgentCompressCommand(t *testing.T) {
+	a, err := New(map[string]any{"cc_data_dir": t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := a.(interface{ CompressCommand() string }).CompressCommand(); got != "/compact" {
+		t.Fatalf("CompressCommand = %q, want /compact", got)
+	}
+}
