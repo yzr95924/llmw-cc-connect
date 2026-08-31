@@ -452,11 +452,11 @@ func TestLlmwClientStopWikiErrorPassthrough(t *testing.T) {
 }
 
 func TestRenderWindows(t *testing.T) {
-	// Empty table.
+	// Empty list.
 	if s := renderWindows(nil, nil); !strings.Contains(s, "没有运行中的窗口") {
 		t.Fatalf("empty render = %q", s)
 	}
-	// Table with alive + dead rows + context column.
+	// List with alive + dead rows + context field.
 	rows := []windowRow{
 		{Wiki: "foo", Window: "foo-main", Backend: "claude", State: "working",
 			UptimeSeconds: ptrFloat(3700), IdleSeconds: ptrFloat(30)},
@@ -466,12 +466,16 @@ func TestRenderWindows(t *testing.T) {
 	}
 	s := renderWindows(rows, map[string]int{"foo-main": 48941})
 	for _, want := range []string{
-		"窗口", "上下文", "foo (foo-main)", "working", "~48.9k", "1h", "exited 2d ago",
-		"dead", "bar (bar-ingest)", "| - |", "baz (baz-main)", "| … |",
+		"foo (foo-main)", "claude", "working", "~48.9k", "up 1h", "idle now",
+		"bar (bar-ingest)", "opencode", "dead", "exited 2d ago",
+		"baz (baz-main)", "waiting", "ctx …",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("render missing %q:\n%s", want, s)
 		}
+	}
+	if strings.Contains(s, "|") {
+		t.Errorf("markdown table syntax leaked into list render:\n%s", s)
 	}
 }
 

@@ -915,32 +915,22 @@ func fmtTokens(n int) string {
 	}
 }
 
-// renderWindows renders `llmw status --json` rows as an IM markdown table
-// (rendered as a monospace <pre> block by the engine's MarkdownToSimpleHTML,
-// so columns stay aligned on every platform). State uses llmw's ASCII
-// contract values verbatim (dead / shell / working / waiting / unknown); dead
-// rows show the idle column as "exited <dur> ago".
+// renderWindows renders `llmw status --json` rows as one compact line per
+// window. Not a markdown table: DingTalk's bot markdown cannot render tables
+// at all, and Telegram tables need a <pre> block — plain lines read fine on
+// every platform. Field set matches the old table (backend / state / context
+// / uptime / idle); state uses llmw's ASCII contract values verbatim (dead /
+// shell / working / waiting / unknown). Dead windows show "exited <dur> ago"
+// instead of ctx/up/idle.
 func renderWindows(rows []windowRow, ctxSizes map[string]int) string {
 	if len(rows) == 0 {
 		return "当前没有运行中的窗口"
 	}
 	var b strings.Builder
-	b.WriteString("| 窗口 | 后端 | 状态 | 上下文 | 运行 | 空闲 |\n")
-	b.WriteString("| --- | --- | --- | --- | --- | --- |\n")
 	for _, r := range rows {
-		uptime := "-"
-		if r.UptimeSeconds != nil {
-			uptime = fmtDur(*r.UptimeSeconds)
-		}
-		idle := "-"
-		if r.Dead {
-			if r.DeadSecondsAgo != nil {
-				idle = "exited " + fmtDur(*r.DeadSecondsAgo) + " ago"
-			} else {
-				idle = "exited"
-			}
-		} else if r.IdleSeconds != nil {
-			idle = fmtDur(*r.IdleSeconds)
+		win := r.Wiki
+		if r.Window != "" && r.Window != r.Wiki {
+			win = r.Wiki + " (" + r.Window + ")"
 		}
 		backend := r.Backend
 		if backend == "" {
@@ -950,19 +940,29 @@ func renderWindows(rows []windowRow, ctxSizes map[string]int) string {
 		if state == "" {
 			state = "unknown"
 		}
-		win := r.Wiki
-		if r.Window != "" && r.Window != r.Wiki {
-			win = r.Wiki + " (" + r.Window + ")"
-		}
-		ctxCol := "…"
+		line := "- " + win + " — " + backend + " · " + state
 		if r.Dead {
-			ctxCol = "-"
-		} else if n, ok := ctxSizes[r.Window]; ok {
-			ctxCol = fmtTokens(n)
+			if r.DeadSecondsAgo != nil {
+				line += " · exited " + fmtDur(*r.DeadSecondsAgo) + " ago"
+			} else {
+				line += " · exited"
+			}
+		} else {
+			ctxCol := "…"
+			if n, ok := ctxSizes[r.Window]; ok {
+				ctxCol = fmtTokens(n)
+			}
+			line += " · ctx " + ctxCol
+			if r.UptimeSeconds != nil {
+				line += " · up " + fmtDur(*r.UptimeSeconds)
+			}
+			if r.IdleSeconds != nil {
+				line += " · idle " + fmtDur(*r.IdleSeconds)
+			}
 		}
-		b.WriteString("| " + win + " | " + backend + " | " + state + " | " + ctxCol + " | " + uptime + " | " + idle + " |\n")
+		b.WriteString(line + "\n")
 	}
-	return b.String()
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // fmtDur mirrors llmw's duration format (<60s "now"; <60m "Nm"; <24h "Nh";

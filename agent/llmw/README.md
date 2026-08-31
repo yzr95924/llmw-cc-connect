@@ -57,7 +57,7 @@ backend = "opencode"   # 唯一合法值（省略即默认）；写别的值启�
 
 | IM 输入 | 行为 |
 | --- | --- |
-| `/llmw`（裸，菜单点击或手敲） | 主机窗口表（wiki / window / state / **上下文** / uptime / idle）+ 本会话绑定 + 用法行；state 为 llmw 的 ASCII 契约值（dead / shell / working / waiting / unknown）。“上下文”列 = 该 wiki 最新 opencode 会话末条 assistant 消息的 tokens（total，缺省 input+cache）——用于判断是否需要 `/compress`；同 wiki 的 main/tg 窗口显示同一最新会话（近似值）；获取失败显示 `…`、dead 窗口 `-`；整个采样预算 30s、每窗口 8s，大 wiki 的 status 会慢几秒 |
+| `/llmw`（裸，菜单点击或手敲） | 主机窗口列表（每窗口一行：window · backend · state · ctx · up · idle；不用 Markdown 表格——钉钉 bot markdown 不渲染表格，Telegram 表格需 `<pre>` 块，纯文本行在所有平台都可读）+ 本会话绑定 + 用法行；state 为 llmw 的 ASCII 契约值（dead / shell / working / waiting / unknown）。“上下文”字段 = 该 wiki 最新 opencode 会话末条 assistant 消息的 tokens（total，缺省 input+cache）——用于判断是否需要 `/compress`；同 wiki 的 main/tg 窗口显示同一最新会话（近似值）；获取失败显示 `…`、dead 窗口不显示上下文而显示 `exited <dur> ago`；整个采样预算 30s、每窗口 8s，大 wiki 的 status 会慢几秒 |
 | `/llmw_list` | 列出 workspace 的 wiki（序号 + display_name + model）；列表 60s 内有效 |
 | 回复 `1` | 进入第 1 个 wiki（数字选择，非命令） |
 | `/llmw_enter <名> [suffix]` | 按 name / display_name 进入 wiki（大小写不敏感，白名单解析）；**菜单裸点退化为 wiki 列表** |
