@@ -18,11 +18,11 @@ import (
 )
 
 const (
-	githubRepo   = "chenhg5/cc-connect"
+	githubRepo   = "yzr95924/llmw-cc-connect" // llmw-fork: update checks hit the fork, never upstream
 	githubAPI    = "https://api.github.com/repos/" + githubRepo + "/releases/latest"
 	githubAllAPI = "https://api.github.com/repos/" + githubRepo + "/releases"
 	downloadBase = "https://github.com/" + githubRepo + "/releases/download"
-	giteeAPI     = "https://gitee.com/api/v5/repos/cg33/cc-connect/releases/latest"
+	giteeAPI     = "https://api.github.com/repos/" + githubRepo + "/releases/latest" // llmw-fork: no Gitee mirror; alias GitHub
 )
 
 // cachedLatestVersion 缓存最新版本信息，避免频繁请求API
@@ -287,7 +287,7 @@ func fetchLatestStableRelease() (*githubRelease, error) {
 func binaryAssetName(tag string) string {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
-	name := fmt.Sprintf("cc-connect-%s-%s-%s", tag, goos, goarch)
+	name := fmt.Sprintf("llmw-connect-%s-%s-%s", tag, goos, goarch) // llmw-fork: renamed assets
 	if goos == "windows" {
 		name += ".exe"
 	}
@@ -297,7 +297,7 @@ func binaryAssetName(tag string) string {
 func archiveAssetName(tag string) string {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
-	base := fmt.Sprintf("cc-connect-%s-%s-%s", tag, goos, goarch)
+	base := fmt.Sprintf("llmw-connect-%s-%s-%s", tag, goos, goarch) // llmw-fork: renamed assets
 	if goos == "windows" {
 		return base + ".zip"
 	}
@@ -337,7 +337,7 @@ func extractFromTarGz(archivePath string) (string, error) {
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		if strings.HasPrefix(hdr.Name, "cc-connect") {
+		if strings.HasPrefix(hdr.Name, "llmw-connect") { // llmw-fork: renamed assets
 			tmp, err := os.CreateTemp("", "cc-connect-update-*")
 			if err != nil {
 				return "", err
@@ -362,7 +362,7 @@ func extractFromZip(archivePath string) (string, error) {
 	defer r.Close()
 
 	for _, f := range r.File {
-		if !strings.HasPrefix(f.Name, "cc-connect") {
+		if !strings.HasPrefix(f.Name, "llmw-connect") { // llmw-fork: renamed assets
 			continue
 		}
 		rc, err := f.Open()
@@ -615,7 +615,7 @@ func syncNpmPackageVersion(execPath, newVer string) {
 	}
 
 	name, _ := pkg["name"].(string)
-	if name != "cc-connect" {
+	if name != "cc-connect" && name != "@yzr95924/llmw-connect" { // llmw-fork: also sync the fork package
 		return
 	}
 
@@ -637,7 +637,7 @@ func syncNpmPackageVersion(execPath, newVer string) {
 	if err := os.WriteFile(pkgJSON, out, 0o644); err != nil {
 		slog.Warn("update: failed to sync npm package.json version", "error", err)
 		fmt.Println("⚠️  Note: npm package version not synced. If the next run re-downloads an old version,")
-		fmt.Println("   please run: npm update -g cc-connect")
+		fmt.Println("   please run: npm update -g @yzr95924/llmw-connect") // llmw-fork: fork package
 	} else {
 		slog.Debug("update: synced npm package.json version", "old", oldVer, "new", newVer)
 	}

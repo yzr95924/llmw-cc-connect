@@ -20,10 +20,13 @@ import (
 )
 
 const (
-	githubReleasesAPI = "https://api.github.com/repos/chenhg5/cc-connect/releases"
-	giteeReleasesAPI  = "https://gitee.com/api/v5/repos/cg33/cc-connect/releases"
-	githubDownload    = "https://github.com/chenhg5/cc-connect/releases/download"
-	giteeDownload     = "https://gitee.com/cg33/cc-connect/releases/download"
+	// llmw-fork: self-update must never replace this binary with upstream
+	// cc-connect, so every source points at the fork repo. No Gitee mirror
+	// exists; the gitee entries alias GitHub (they only act as fallback).
+	githubReleasesAPI = "https://api.github.com/repos/yzr95924/llmw-cc-connect/releases"
+	giteeReleasesAPI  = "https://api.github.com/repos/yzr95924/llmw-cc-connect/releases"
+	githubDownload    = "https://github.com/yzr95924/llmw-cc-connect/releases/download"
+	giteeDownload     = "https://github.com/yzr95924/llmw-cc-connect/releases/download"
 )
 
 type ReleaseInfo struct {
@@ -132,7 +135,7 @@ func SelfUpdate(tag string, preferGitee bool) error {
 	if goos == "windows" {
 		ext = ".zip"
 	}
-	filename := fmt.Sprintf("cc-connect-%s-%s-%s%s", tag, goos, goarch, ext)
+	filename := fmt.Sprintf("llmw-connect-%s-%s-%s%s", tag, goos, goarch, ext) // llmw-fork: renamed asset prefix
 
 	giteeURL := fmt.Sprintf("%s/%s/%s", giteeDownload, tag, filename)
 	githubURL := fmt.Sprintf("%s/%s/%s", githubDownload, tag, filename)
