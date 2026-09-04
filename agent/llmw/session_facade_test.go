@@ -103,6 +103,16 @@ type fakePaneRunner struct {
 	// nothing changes), not an error.
 	lastCapture string
 
+	// bootBlanks: the first N captures read as a blank screen — models a
+	// freshly created window whose opencode TUI has not drawn yet (the
+	// boot race WaitReady absorbs).
+	bootBlanks int
+
+	// injectedDuringBoot records, per inject, whether the screen was still
+	// blank/unanchored at that moment — asserts prompts never land before
+	// the TUI booted.
+	injectedDuringBoot []bool
+
 	// exportSeq: per-session evolving export snapshots (pseudo-stream
 	// tests). Each exportJSON call pops the next frame; the last frame
 	// repeats. Sessions absent here fall back to the static exports map.
@@ -113,6 +123,7 @@ func (r *fakePaneRunner) inject(text string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.injected = append(r.injected, text)
+	r.injectedDuringBoot = append(r.injectedDuringBoot, r.bootBlanks > 0 || !paneAnchorsReadable(r.lastCapture))
 	return nil
 }
 func (r *fakePaneRunner) submit() error { return nil }
@@ -139,6 +150,10 @@ func (r *fakePaneRunner) sendKey(key string) error {
 func (r *fakePaneRunner) capture() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.bootBlanks > 0 {
+		r.bootBlanks--
+		return "", nil // TUI still booting: blank screen, no anchors
+	}
 	if r.uiMode != "" {
 		bar := r.uiMode // the real TUI capitalizes the subagent name
 		if bar == "build" {
@@ -188,6 +203,13 @@ func (r *fakePaneRunner) lastInjected() string {
 	return r.injected[len(r.injected)-1]
 }
 
+// currentUIMode snapshots the simulated subagent bar ("" when absent).
+func (r *fakePaneRunner) currentUIMode() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.uiMode
+}
+
 func (r *fakePaneRunner) sentKeysLen() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -231,6 +253,9 @@ func newTestAgent(t *testing.T) (*llmwAgent, *scriptRunner, map[string]*fakePane
 	oldPoll, oldSettle := panePollInterval, paneSettleDelay
 	panePollInterval, paneSettleDelay = 5*time.Millisecond, time.Millisecond
 	t.Cleanup(func() { panePollInterval, paneSettleDelay = oldPoll, oldSettle })
+	oldBoot := paneBootTimeout
+	paneBootTimeout = 2 * time.Second
+	t.Cleanup(func() { paneBootTimeout = oldBoot })
 
 	ws := t.TempDir()
 	t.Setenv("LLMW_WORKSPACE", ws)
@@ -1262,6 +1287,92 @@ func TestFacadeAbortBusyForwardsEscape(t *testing.T) {
 	}
 }
 
+// /llmw_compact on a bound window reaches the pane as the TUI /compact
+// command. Regression (2026-09-05): the engine builtin /compress fails
+// with "no active session" after /model recycles the interactive state —
+// the custom command rides the ordinary message path instead.
+func TestFacadeCompactForwards(t *testing.T) {
+	a, _, panes := newTestAgent(t)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send enter: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "已进入 wiki：foo") {
+		t.Fatalf("want entry confirmation, got %q", evStr(ev))
+	}
+	fr := panes["foo"]
+	fr.mu.Lock()
+	fr.captures = []string{"idle ctrl+p commands", "idle ctrl+p commands"}
+	fr.mu.Unlock()
+
+	if err := f.Send(llmwCmd("compact"), "", nil, nil); err != nil {
+		t.Fatalf("Send compact: %v", err)
+	}
+	if got := fr.lastInjected(); got != compactCmd {
+		t.Fatalf("injected = %q, want %q", got, compactCmd)
+	}
+}
+
+// /llmw_compact on an unbound facade asks the user to enter a wiki first
+// (same guidance as /llmw_new; no panic, no injection).
+func TestFacadeCompactUnboundGuides(t *testing.T) {
+	a, _, _ := newTestAgent(t)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send(llmwCmd("compact"), "", nil, nil); err != nil {
+		t.Fatalf("Send compact: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "请先 /llmw enter") {
+		t.Fatalf("want unbound guidance, got %q", evStr(ev))
+	}
+}
+
+// Enter confirmations advertise the mode (plan/build) next to the model so
+// a re-entered or switched session shows its subagent up front (2026-09-05).
+// Both sources must surface: agent target fallback (fake pane captures carry
+// no mode marker) and live pane mode.
+func TestEnterConfirmShowsMode(t *testing.T) {
+	a, _, panes := newTestAgent(t)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send enter: %v", err)
+	}
+	ev := waitEvent(f.events, time.Second)
+	if ev == nil || !contains(ev.Content, "已进入 wiki：foo") {
+		t.Fatalf("want entry confirmation, got %q", evStr(ev))
+	}
+	if !contains(ev.Content, "模式: build") {
+		t.Fatalf("want default mode in confirmation, got %q", evStr(ev))
+	}
+
+	// Target mode change is reflected on the next idempotent re-enter.
+	a.SetMode("plan")
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send re-enter: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "模式: plan") {
+		t.Fatalf("want plan mode in re-enter confirmation, got %q", evStr(ev))
+	}
+
+	// Live pane mode outranks the agent target: a manual Tab in the host
+	// window (uiMode) shows the window's actual subagent, not the target.
+	a.SetMode("build")
+	panes["foo"].mu.Lock()
+	panes["foo"].uiMode = "plan"
+	panes["foo"].mu.Unlock()
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send live-mode re-enter: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "模式: plan") {
+		t.Fatalf("want live plan mode to outrank target build, got %q", evStr(ev))
+	}
+}
+
 // /llmw_new on a bound window reaches the pane as the TUI /new command.
 func TestFacadeNewSessionForwards(t *testing.T) {
 	a, _, panes := newTestAgent(t)
@@ -1352,6 +1463,125 @@ func TestFacadeEnterSelfCheckWarns(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("want enter + drift warning, entered=%v warned=%v", entered, warned)
 		}
+	}
+}
+
+// Regression (2026-09-05): a fresh window's opencode TUI boots for seconds
+// AFTER `llmw wiki enter` returns. SelfCheck used to sample the blank boot
+// screen (2×300ms) and raise the "界面契约异常" false alarm on a perfectly
+// healthy window. Enter must wait for the first anchor before self-checking.
+func TestFacadeEnterWaitsTUIBoot_NoFalseContractAlarm(t *testing.T) {
+	a, _, panes := newTestAgent(t)
+	a.paneFactory = func(ctx context.Context, target, workDir string) core.AgentSession {
+		// Slow boot: blank screen for the first captures, then the idle
+		// footer draws (script-exhausted frames repeat).
+		fr := &fakePaneRunner{workDir: workDir, bootBlanks: 3, captures: []string{"idle ctrl+p commands"}}
+		panes[filepath.Base(workDir)] = fr
+		return newPaneSession(ctx, fr, workDir)
+	}
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	var alarmed, entered bool
+	deadline := time.After(3 * time.Second)
+	for !entered {
+		select {
+		case ev, ok := <-f.events:
+			if !ok {
+				t.Fatal("events closed")
+			}
+			if ev.Type != core.EventText {
+				continue
+			}
+			if contains(ev.Content, "已进入 wiki") {
+				entered = true
+			}
+			if contains(ev.Content, "界面契约异常") {
+				alarmed = true
+			}
+		case <-deadline:
+			t.Fatalf("enter confirmation never arrived (alarmed=%v)", alarmed)
+		}
+	}
+	if alarmed {
+		t.Fatal("slow TUI boot must not raise the 界面契约异常 alarm")
+	}
+}
+
+// Regression (2026-09-05), same boot-race class: when the window dies and
+// the next ordinary message lazily rebuilds it, the prompt used to be
+// pasted into the pane while the TUI was still booting (busy gate reads a
+// blank screen as idle). The rebuild must wait for the first anchor before
+// injecting.
+func TestFacadeLazyRebuildWaitsTUIBootBeforeInject(t *testing.T) {
+	a, runner, panes := newTestAgent(t)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已进入 wiki") {
+		t.Fatalf("want entry confirmation, got %q", evStr(ev))
+	}
+
+	// The host window dies (status row gone) and the pane mirror closes:
+	// the next message rebuilds the window — a fresh TUI boot.
+	runner.mu.Lock()
+	runner.windows = nil
+	runner.mu.Unlock()
+	f.mu.Lock()
+	_ = f.inner.Close()
+	f.mu.Unlock()
+	a.paneFactory = func(ctx context.Context, target, workDir string) core.AgentSession {
+		fr := &fakePaneRunner{workDir: workDir, bootBlanks: 3, captures: []string{"idle ctrl+p commands"}, sessions: "[]", exports: map[string]string{}}
+		panes[filepath.Base(workDir)] = fr
+		return newPaneSession(ctx, fr, workDir)
+	}
+
+	if err := f.Send("hello after rebuild", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	fr := panes["foo"]
+	fr.mu.Lock()
+	injected := len(fr.injected)
+	duringBoot := len(fr.injectedDuringBoot) > 0 && fr.injectedDuringBoot[0]
+	fr.mu.Unlock()
+	if injected != 1 {
+		t.Fatalf("injected %d prompts, want 1", injected)
+	}
+	if duringBoot {
+		t.Fatal("prompt was injected while the TUI was still booting (blank screen)")
+	}
+}
+
+// Regression (2026-09-05), same boot-race class: the fresh-window mode
+// alignment used to read the blank boot screen ("no subagent indicator")
+// and silently give up, leaving the window in build while the agent-level
+// target was plan. Alignment must run after the TUI is ready.
+func TestFacadeEnterAlignsModeAfterTUIBoot(t *testing.T) {
+	a, _, panes := newTestAgent(t)
+	a.paneFactory = func(ctx context.Context, target, workDir string) core.AgentSession {
+		// Slow boot, then a build subagent bar (Tab-responsive via uiMode).
+		fr := &fakePaneRunner{workDir: workDir, bootBlanks: 5, uiMode: "build"}
+		panes[filepath.Base(workDir)] = fr
+		return newPaneSession(ctx, fr, workDir)
+	}
+	a.SetMode("plan")
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已进入 wiki") {
+		t.Fatalf("want entry confirmation, got %q", evStr(ev))
+	}
+	if got := panes["foo"].currentUIMode(); got != "plan" {
+		t.Fatalf("fresh window mode = %q, want plan (alignment raced the TUI boot)", got)
 	}
 }
 

@@ -81,6 +81,12 @@ var (
 	// progressive tool/text events to the engine (pseudo-stream; the export
 	// snapshot is diffed against what was already emitted).
 	paneStreamInterval = 2 * time.Second
+	// paneBootTimeout bounds the wait for a fresh window's TUI to draw its
+	// first anchor after `llmw wiki enter` creates the byobu window — the
+	// CLI returns when the WINDOW exists, the opencode TUI keeps booting
+	// for seconds after that (the live smoke gate budgets 20s for the same
+	// boot). Var so tests can shrink it.
+	paneBootTimeout = 20 * time.Second
 )
 
 // paneRunner abstracts the external commands the driver needs (real: tmux on
@@ -532,11 +538,23 @@ func (s *paneSession) runNewSession() error {
 	return nil
 }
 
+// WaitReady blocks until any TUI anchor is readable — the opencode TUI
+// finished booting — or the timeout expires. Every pane read/write before
+// the first anchor sees a blank boot screen: the drift self-check false
+// alarms, mode/model alignment silently fails, and injected prompts land
+// before the TUI consumes input. Returns false on timeout; the caller
+// falls through to SelfCheck, which turns a still-blank pane into the
+// user-facing drift alarm.
+func (s *paneSession) WaitReady(timeout time.Duration) bool {
+	return s.waitPane(paneAnchorsReadable, timeout)
+}
+
 // SelfCheck reports whether the attached pane still speaks the TUI anchor
 // contract: any of the busy marker, the idle footer hint, or the bottom
 // mode bar must be readable. "" = healthy; otherwise a user-facing warning
 // (opencode upgraded its UI, or the window is not running opencode at all).
-// One retry absorbs mid-redraw blank frames.
+// One retry absorbs mid-redraw blank frames. Call WaitReady first on a
+// fresh window — this is a drift check, not a boot check.
 func (s *paneSession) SelfCheck() string {
 	for try := 0; try < 2; try++ {
 		cap, err := s.runner.capture()
@@ -877,6 +895,17 @@ func (s *paneSession) GetPaneModel() string {
 		return ""
 	}
 	return paneModelFromCapture(cap)
+}
+
+// GetPaneMode reports the window's current subagent (build/plan) from the
+// status bar; "" when the pane cannot be read (callers fall back to the
+// agent's target mode).
+func (s *paneSession) GetPaneMode() string {
+	cap, err := s.runner.capture()
+	if err != nil {
+		return ""
+	}
+	return currentPaneMode(cap)
 }
 
 // splitModelID splits "provider/model" ids from `opencode models`.

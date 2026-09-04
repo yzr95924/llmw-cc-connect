@@ -217,7 +217,7 @@ func (f *sessionFacade) ensureInnerLocked() error {
 // number retries instead of being told the list expired.
 func (f *sessionFacade) enterWikiLocked(w *wikiEntry, suffix string) {
 	if f.wiki != nil && f.wiki.Name == w.Name && f.suffix == suffix {
-		f.emitLocked("已在 wiki：" + displayWiki(w))
+		f.emitLocked("已在 wiki：" + displayWiki(w, f.modelLabelLocked(), f.modeLabelLocked()))
 		return
 	}
 	if err := f.doEnterLocked(w, suffix, true); err == nil {
@@ -308,14 +308,25 @@ func (f *sessionFacade) executeStopLocked(name, suffix string) {
 		// window is not resurrected by the next message.
 		f.suffix = ""
 		f.id = facadeID(f.wiki.Name, "")
+		f.a.forgetBinding(facadeID(w.Name, suffix)) // the stopped window must stay dead
+		f.a.rememberBinding(f.id)                   // main is the new binding target
 		f.emitLocked("✓ 已停止 " + w.Name + " 的窗口 " + win + "；本会话已换绑 main 窗口，下条消息将进入 main")
 	case stoppedOwn && suffix == "":
 		// Stopped our own main binding: the wiki session is down, so unbind —
 		// next message asks the user to /llmw enter again.
 		f.wiki = nil
 		f.suffix = ""
+		f.a.forgetBinding(f.id)
 		f.emitLocked("✓ 已停止 " + w.Name + " 的 main 窗口；wiki 会话已下线，本会话已解绑（/llmw enter <名> 重新进入）")
 	default:
+		// Stopped a window that is NOT this session's binding (another
+		// chat's window, or a wiki this session never entered). The
+		// binding MEMORY for that window must still go: a facade whose
+		// binding points here was closed (e.g. /model recycle), its
+		// StartSession recall would re-enter and re-CREATE the window the
+		// user just stopped. The live-facade path (ensureInnerLocked) is
+		// unchanged — see README 绑定记忆 notes.
+		f.a.forgetBinding(facadeID(w.Name, suffix))
 		f.emitLocked("✓ 已停止 " + w.Name + " 的主机窗口（" + win + "）")
 	}
 }
@@ -330,34 +341,61 @@ func isConfirmReply(prompt string) bool {
 // (TUI /new): old session stays in the DB, the window context resets. Not
 // destructive, so no confirmation gate.
 func (f *sessionFacade) handleNewLocked() {
-	if f.wiki == nil {
-		f.emitLocked("本会话未绑定 wiki，请先 /llmw enter <名>")
+	inner := f.requirePaneLocked()
+	if inner == nil {
 		return
 	}
-	if err := f.ensureInnerLocked(); err != nil {
-		f.emitLocked("agent 不可用：" + err.Error() + "。请检查 opencode CLI 安装")
-		return
-	}
-	if err := f.inner.Send(newCmd, "", nil, nil); err != nil {
+	if err := inner.Send(newCmd, "", nil, nil); err != nil {
 		f.emitLocked("开新会话失败：" + err.Error())
 		f.emitResultLocked()
 	}
 	// Success path: the pane session emits its own text + result events.
 }
 
+// handleCompactLocked compacts the bound window's session context (TUI
+// /compact). Custom command replacing the engine builtin: /model recycles
+// the engine-side interactive state the builtin requires, so builtin
+// /compress answered "no active session" right after a model switch (same
+// reason /llmw_abort replaced engine /cancel). Reaching the agent session
+// at all lazily re-attaches the window (binding memory / ensureInner), so
+// this works in every state where an ordinary message would. The pane's
+// busy gate rejects a mid-turn compact.
+func (f *sessionFacade) handleCompactLocked() {
+	inner := f.requirePaneLocked()
+	if inner == nil {
+		return
+	}
+	if err := inner.Send(compactCmd, "", nil, nil); err != nil {
+		f.emitLocked("压缩会话失败：" + err.Error())
+		f.emitResultLocked()
+	}
+	// Success path: the pane session emits its own text + result events.
+}
+
+// requirePaneLocked guards the pane-command handlers: the session must be
+// bound and the inner pane attached. On a failed guard the user-facing
+// guidance is emitted and nil returned; handlers abort on nil.
+func (f *sessionFacade) requirePaneLocked() core.AgentSession {
+	if f.wiki == nil {
+		f.emitLocked("本会话未绑定 wiki，请先 /llmw enter <名>")
+		return nil
+	}
+	if err := f.ensureInnerLocked(); err != nil {
+		f.emitLocked("agent 不可用：" + err.Error() + "。请检查 opencode CLI 安装")
+		return nil
+	}
+	return f.inner
+}
+
 // handleAbortLocked interrupts the running turn in the bound window via
 // ESC. ensureInner reattaches a dead pane first, so a HOST-started turn in
 // the window is abortable too.
 func (f *sessionFacade) handleAbortLocked() {
-	if f.wiki == nil {
-		f.emitLocked("本会话未绑定 wiki，请先 /llmw enter <名>")
+	inner := f.requirePaneLocked()
+	if inner == nil {
 		return
 	}
-	if err := f.ensureInnerLocked(); err != nil {
-		f.emitLocked("agent 不可用：" + err.Error() + "。请检查 opencode CLI 安装")
-		return
-	}
-	ab, ok := f.inner.(interface{ Abort() error })
+	ab, ok := inner.(interface{ Abort() error })
 	if !ok {
 		f.emitLocked("内部会话不支持中止")
 		return
@@ -387,6 +425,7 @@ func (f *sessionFacade) handleDetachLocked() {
 	f.wiki = nil
 	f.suffix = ""
 	f.pending = nil
+	f.a.forgetBinding(f.id) // the user asked to unbind: never auto re-enter
 	f.emitLocked("✓ 已解绑 " + name + "（主机窗口保留；/llmw enter <名> 或 /llmw switch 重新接入）")
 }
 
@@ -418,7 +457,7 @@ func (f *sessionFacade) handleStatusLocked() {
 		if f.suffix != "" {
 			win = f.wiki.Name + "-" + f.suffix
 		}
-		b.WriteString("\n\n📌 本会话绑定：" + displayWiki(f.wiki) + "（窗口 " + win + "，" + state + "）")
+		b.WriteString("\n\n📌 本会话绑定：" + displayWiki(f.wiki, f.modelLabelLocked(), f.modeLabelLocked()) + "（窗口 " + win + "，" + state + "）")
 	} else {
 		b.WriteString("\n\n📌 本会话未绑定 wiki（/llmw list 选序号，或 /llmw enter <名>）")
 	}
@@ -448,6 +487,8 @@ func (f *sessionFacade) handleLlmwCommandLocked(c llmwCommand) {
 		f.handleAbortLocked()
 	case "new":
 		f.handleNewLocked()
+	case "compact":
+		f.handleCompactLocked()
 	case "moved":
 		f.emitLocked("命令已统一为下划线形式：/llmw_list、/llmw_enter、/llmw_switch、/llmw_stop、/llmw_detach（裸 /llmw = 状态）")
 		f.emitLocked(llmwUsage)
@@ -478,6 +519,7 @@ func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool
 		f.inner = nil
 	}
 	prevWiki, prevSuffix := f.wiki, f.suffix
+	prevID := f.id
 	f.wiki = w
 	f.suffix = suffix
 
@@ -487,7 +529,9 @@ func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool
 	}
 
 	row := f.lookupWindowLocked(windowName)
+	fresh := false
 	if row == nil {
+		fresh = true
 		ectx, ecancel := context.WithTimeout(f.a.ctx, enterTimeout)
 		err := f.a.client.enterWiki(ectx, w.Name, suffix)
 		ecancel()
@@ -515,6 +559,19 @@ func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool
 	target := row.Session + ":" + row.Window
 	f.inner = f.a.paneFactory(f.a.ctx, target, workDir)
 	f.id = facadeID(w.Name, suffix)
+	// Fresh windows boot the opencode TUI for seconds AFTER `llmw wiki
+	// enter` returns (the CLI reports the byobu window, not the TUI). Wait
+	// for the first anchor before anything else touches the pane: the drift
+	// self-check below, the mode/model alignment, and the first message
+	// injection all race a blank boot screen otherwise (false "契约异常"
+	// alarm, silently lost alignment, prompts pasted before the TUI
+	// consumes input). A timeout falls through to SelfCheck, which reports
+	// genuine drift.
+	if fresh {
+		if wr, ok := f.inner.(interface{ WaitReady(time.Duration) bool }); ok && !wr.WaitReady(paneBootTimeout) {
+			slog.Warn(agentName+": fresh window TUI boot wait timed out", "window", windowName)
+		}
+	}
 	// Passive drift alarm: if none of the TUI anchors is readable the pane
 	// is either not opencode or its UI contract changed (upgrade) — tell
 	// the user instead of failing silently on the next turn.
@@ -544,7 +601,18 @@ func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool
 	}
 	go f.pump(f.inner.Events())
 	if announce {
-		f.emitLocked("✓ 已进入 wiki：" + displayWiki(w) + "（窗口 " + row.Window + "）")
+		f.emitLocked("✓ 已进入 wiki：" + displayWiki(w, f.modelLabelLocked(), f.modeLabelLocked()) + "（窗口 " + row.Window + "）")
+	}
+	// Record the binding for StartSession's in-process re-enter (see
+	// llmwAgent.bindings): the engine closes live facades on /model, and
+	// the next StartSession must reattach instead of asking the user to
+	// re-enter. A wiki switch also forgets the previous id's binding —
+	// the engine persists the CURRENT f.id, so a stale entry could only
+	// ever fire on an abandoned id.
+	newID := facadeID(w.Name, suffix)
+	f.a.rememberBinding(newID)
+	if prevID != newID {
+		f.a.forgetBinding(prevID)
 	}
 	return nil
 }
@@ -641,7 +709,7 @@ func (f *sessionFacade) handleWikisLocked() {
 		b.WriteString("\n")
 		b.WriteString(strconv.Itoa(i + 1))
 		b.WriteString(". ")
-		b.WriteString(displayWiki(&available[i]))
+		b.WriteString(displayWiki(&available[i], available[i].Model, ""))
 	}
 	b.WriteString("\n（或直接 /llmw enter <名> 进入）")
 	f.emitLocked(b.String())
@@ -741,23 +809,61 @@ func (f *sessionFacade) emitResultLocked() {
 	f.events <- core.Event{Type: core.EventResult, Done: true, SessionID: f.id}
 }
 
+// modelLabelLocked reports the model to advertise for the bound window:
+// the live pane bottom-bar model when readable (truth after /model hot
+// switches), else the wiki overlay's default. Cheap: one capture. Same
+// live-first rule as modeLabelLocked so one display line never mixes
+// static and live sources.
+func (f *sessionFacade) modelLabelLocked() string {
+	if f.inner != nil {
+		if gm, ok := f.inner.(interface{ GetPaneModel() string }); ok {
+			if m := gm.GetPaneModel(); m != "" {
+				return m
+			}
+		}
+	}
+	return f.wiki.Model
+}
+
+// modeLabelLocked reports the mode to advertise for the bound window: the
+// live pane subagent when readable (truth after enter-alignment or a manual
+// Tab in the host window), else the agent's target mode. Cheap: one capture.
+func (f *sessionFacade) modeLabelLocked() string {
+	if f.inner != nil {
+		if pm, ok := f.inner.(interface{ GetPaneMode() string }); ok {
+			if m := pm.GetPaneMode(); m != "" {
+				return m
+			}
+		}
+	}
+	return f.a.GetMode()
+}
+
 func facadeID(wiki, innerID string) string {
 	return "llmw:" + wiki + ":" + innerID
 }
 
-func displayWiki(w *wikiEntry) string {
+// displayWiki renders a wiki for enter confirmations, the status binding
+// line, and the list. model/mode are caller-chosen labels (live-first from
+// the facade for bound displays, static overlay values for the list); ""
+// omits the segment.
+func displayWiki(w *wikiEntry, model, mode string) string {
 	name := w.DisplayName
 	if name == "" {
 		name = w.Name
 	}
-	if w.Model != "" {
-		return name + " — 模型: " + w.Model
+	s := name
+	if model != "" {
+		s += " — 模型: " + model
 	}
-	return name
+	if mode != "" {
+		s += " — 模式: " + mode
+	}
+	return s
 }
 
 // llmwUsage is the /llmw command usage line (design §7.5).
-const llmwUsage = "💡 用法：/llmw（状态）| /llmw_list | /llmw_enter <wiki> [suffix] | /llmw_stop [wiki] [suffix] | /llmw_switch | /llmw_detach | /llmw_abort | /llmw_new"
+const llmwUsage = "💡 用法：/llmw（状态）| /llmw_list | /llmw_enter <wiki> [suffix] | /llmw_stop [wiki] [suffix] | /llmw_switch | /llmw_detach | /llmw_abort | /llmw_new | /llmw_compact"
 
 // llmwCommand is a parsed /llmw command. verb ∈ {status, list, enter, stop,
 // switch, usage}; verb "usage" means the /llmw prefix matched but the syntax did not —
@@ -819,6 +925,11 @@ func parseLlmwCommand(prompt string) (llmwCommand, bool) {
 	case "new":
 		if len(args) == 1 {
 			return llmwCommand{verb: "new"}, true
+		}
+		return llmwCommand{verb: "usage"}, true
+	case "compact":
+		if len(args) == 1 {
+			return llmwCommand{verb: "compact"}, true
 		}
 		return llmwCommand{verb: "usage"}, true
 	case "status":

@@ -55,6 +55,7 @@ const (
 	enterMenuCommand     = "进入 wiki（手敲 /llmw_enter <名> [suffix]）\n<llmw:menu> enter"
 	abortMenuCommand     = "中止当前窗口进行中的回合（发送 ESC）\n<llmw:menu> abort"
 	newMenuCommand       = "开启新会话（当前窗口，旧会话保留可续）\n<llmw:menu> new"
+	compactMenuCommand   = "压缩当前窗口的会话上下文（TUI /compact）\n<llmw:menu> compact"
 
 	// legacyWikisCommand is the v2 content of wikis.md (superseded by the
 	// /llmw prefix family, design §7.5). installCommands removes wikis.md
@@ -87,6 +88,21 @@ type llmwAgent struct {
 	// is applied when the next window attaches (doEnterLocked).
 	model atomic.Value
 
+	// bindings remembers the facade ids the user has entered. In-process
+	// memory only: it lets StartSession silently re-enter after the ENGINE
+	// closes a live facade for reasons that do not imply unbinding (the
+	// /model flow recycles the interactive session on the assumption that
+	// agents restart as headless processes). The id itself encodes
+	// wiki+suffix (parseFacadeID), so a plain set suffices. Daemon restarts
+	// wipe it, preserving the "explicit enter after restart" contract;
+	// user-initiated unbinds (stop own window, detach) clear it so stopped
+	// windows are never resurrected. Guarded by bindMu (a leaf lock):
+	// recorded from doEnterLocked under f.mu and read from StartSession
+	// outside a.mu, so it must not take either lock (removeFacade acquires
+	// a.mu under f.mu — the opposite order would deadlock).
+	bindMu   sync.Mutex
+	bindings map[string]struct{}
+
 	// paneFactory is injectable for tests. Production builds a paneSession
 	// over the real tmux server and the opencode CLI.
 	paneFactory func(ctx context.Context, target, workDir string) core.AgentSession
@@ -94,6 +110,35 @@ type llmwAgent struct {
 	// dataDir is the cc-connect data dir (opts cc_data_dir) where the
 	// /llmw command file is installed.
 	dataDir string
+}
+
+// rememberBinding marks a facade id as bound (wiki+suffix parse from the
+// id itself).
+func (a *llmwAgent) rememberBinding(id string) {
+	if id == "" {
+		return
+	}
+	a.bindMu.Lock()
+	defer a.bindMu.Unlock()
+	if a.bindings == nil {
+		a.bindings = make(map[string]struct{})
+	}
+	a.bindings[id] = struct{}{}
+}
+
+// forgetBinding drops the remembered binding (user unbound/stopped).
+func (a *llmwAgent) forgetBinding(id string) {
+	a.bindMu.Lock()
+	defer a.bindMu.Unlock()
+	delete(a.bindings, id)
+}
+
+// bindingRemembered reports whether id holds a remembered binding.
+func (a *llmwAgent) bindingRemembered(id string) bool {
+	a.bindMu.Lock()
+	defer a.bindMu.Unlock()
+	_, ok := a.bindings[id]
+	return ok
 }
 
 // SetMode stores the target opencode subagent (build/plan). The engine
@@ -163,23 +208,51 @@ func (a *llmwAgent) Name() string { return agentName }
 // (the window itself survives daemon restarts in byobu; re-enter reattaches).
 func (a *llmwAgent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	if f, ok := a.sessions[sessionID]; ok {
+		a.mu.Unlock()
 		return f, nil
 	}
 	f := newSessionFacade(a, sessionID)
 	a.sessions[sessionID] = f
+	a.mu.Unlock()
 
-	// Deliberately NO implicit resume here. cc-connect calls StartSession
-	// identically for post-restart recovery and for engine /switch rebinds,
-	// and the engine's persisted agent_session_id cannot be cleared from the
-	// agent side — so a resume here would resurrect windows the user stopped
-	// and silently re-attach after every daemon restart. Binding is instead
-	// always explicit: the facade starts unbound and the user /llmw enters
-	// (or /llmw switch → number) to attach. See README "重启后绑定作废".
-	if ours := func() bool { _, _, ok := parseFacadeID(sessionID); return ok }(); ours {
+	// Deliberately NO implicit resume from the PERSISTED id alone.
+	// cc-connect calls StartSession identically for post-restart recovery
+	// and for engine /switch rebinds, and the engine's persisted
+	// agent_session_id cannot be cleared from the agent side — so resuming
+	// on the id would resurrect windows the user stopped and silently
+	// re-attach after every daemon restart. Binding is instead always
+	// explicit: the facade starts unbound and the user /llmw enters (or
+	// /llmw switch → number) to attach. See README "重启后绑定作废".
+	wikiName, suffix, ours := parseFacadeID(sessionID)
+	remembered := a.bindingRemembered(sessionID)
+	if ours && !remembered {
 		slog.Info("llmw: session created unbound (explicit enter required)", "id", sessionID)
+	}
+
+	// EXCEPT when this process remembers the binding: the engine closes
+	// live facades for reasons that do not imply unbinding — the /model
+	// flow recycles the interactive session so headless agents restart
+	// with `--resume <id> --model <new>`, which would otherwise drop the
+	// wiki binding (fix 2026-09-05: "/model then message → 请先 /llmw
+	// list"). The id itself names the window (parseFacadeID). Re-enter
+	// silently; failure leaves the facade unbound and the user gets the
+	// explicit-enter guidance as before. Runs OUTSIDE a.mu: doEnterLocked
+	// takes f.mu and runs llmw CLI subprocesses, and removeFacade takes
+	// a.mu under f.mu — holding a.mu here would deadlock.
+	if remembered {
+		if w, err := a.findWiki(ctx, wikiName); err == nil {
+			f.mu.Lock()
+			err := f.doEnterLocked(w, suffix, false)
+			f.mu.Unlock()
+			if err == nil {
+				slog.Info("llmw: re-entered remembered wiki binding", "id", sessionID, "wiki", wikiName, "suffix", suffix)
+			} else {
+				slog.Warn("llmw: remembered binding re-enter failed", "id", sessionID, "wiki", wikiName, "err", err)
+			}
+		} else {
+			slog.Warn("llmw: remembered binding no longer resolves", "id", sessionID, "wiki", wikiName, "err", err)
+		}
 	}
 	return f, nil
 }
@@ -326,6 +399,7 @@ func (a *llmwAgent) installCommands() error {
 		{"llmw_enter.md", enterMenuCommand, nil},
 		{"llmw_abort.md", abortMenuCommand, nil},
 		{"llmw_new.md", newMenuCommand, nil},
+		{"llmw_compact.md", compactMenuCommand, nil},
 	}
 	for _, mf := range menuFiles {
 		if err := a.installCommandFile(filepath.Join(dir, mf.name), mf.current, mf.legacy); err != nil {

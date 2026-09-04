@@ -301,6 +301,7 @@ func TestParseLlmwCommand(t *testing.T) {
 		{"llmw workspace 管理\n<llmw:menu> abort", true, llmwCommand{verb: "abort"}},
 		{"llmw workspace 管理\n<llmw:menu> abort now", true, llmwCommand{verb: "usage"}},
 		{"llmw workspace 管理\n<llmw:menu> new", true, llmwCommand{verb: "new"}},
+		{"llmw workspace 管理\n<llmw:menu> compact", true, llmwCommand{verb: "compact"}},
 		{"llmw workspace 管理\n<llmw:menu> new foo", true, llmwCommand{verb: "usage"}},
 		// Case-insensitive command word; name keeps case (findWiki is CI).
 		{"llmw workspace 管理\n<llmw:menu> List", true, llmwCommand{verb: "list"}},
@@ -746,6 +747,205 @@ func TestStartSessionUnboundNoImplicitResume(t *testing.T) {
 	}
 }
 
+// Regression (2026-09-05): the engine's /model flow recycles the
+// interactive session (cleanupInteractiveState → facade.Close) on the
+// assumption that agents restart as headless processes with
+// `--resume <id> --model <new>`. For the pane driver that close dropped
+// the wiki binding and the next message hit "请先 /llmw list 选择 wiki".
+// StartSession must silently re-enter the remembered in-process binding.
+func TestStartSessionReentersRememberedBinding(t *testing.T) {
+	a, _, panes := newTestAgent(t)
+
+	// Engine starts the session (persisted id), user enters foo.
+	sess, err := a.StartSession(context.Background(), "llmw:foo:")
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	f := sess.(*sessionFacade)
+	defer f.Close()
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send enter: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已进入 wiki") {
+		t.Fatalf("want entry confirmation, got %q", evStr(ev))
+	}
+
+	// The engine closes the facade (the /model flow).
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Next message: StartSession must re-enter the remembered binding.
+	sess2, err := a.StartSession(context.Background(), "llmw:foo:")
+	if err != nil {
+		t.Fatalf("StartSession 2: %v", err)
+	}
+	f2 := sess2.(*sessionFacade)
+	defer f2.Close()
+	if err := f2.Send("hello again", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := panes["foo"].lastInjected(); got != "hello again" {
+		t.Fatalf("injected = %q, want the message forwarded to the re-entered window", got)
+	}
+}
+
+// Detach must clear the remembered binding: the engine may still recycle
+// the session afterwards, and a stale memory would resurrect the binding
+// the user explicitly dropped.
+func TestStartSessionDoesNotResurrectAfterDetach(t *testing.T) {
+	a, _, _ := newTestAgent(t)
+	sess, _ := a.StartSession(context.Background(), "llmw:foo:")
+	f := sess.(*sessionFacade)
+	defer f.Close()
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send enter: %v", err)
+	}
+	waitEvent(f.events, 3*time.Second)
+	if err := f.Send(llmwCmd("detach"), "", nil, nil); err != nil {
+		t.Fatalf("Send detach: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已解绑") {
+		t.Fatalf("want detach confirmation, got %q", evStr(ev))
+	}
+	f.Close()
+
+	sess2, _ := a.StartSession(context.Background(), "llmw:foo:")
+	f2 := sess2.(*sessionFacade)
+	defer f2.Close()
+	if err := f2.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := waitEvent(f2.events, 3*time.Second); ev == nil || !contains(ev.Content, "请先 /llmw list") {
+		t.Fatalf("detached binding must stay unbound, got %q", evStr(ev))
+	}
+}
+
+// Stopping the own main window unbinds — the remembered binding must go
+// with it, or a later engine session recycle would re-create the window
+// the user killed.
+func TestStartSessionDoesNotResurrectAfterStopOwnMain(t *testing.T) {
+	a, _, _ := newTestAgent(t)
+	sess, _ := a.StartSession(context.Background(), "llmw:foo:")
+	f := sess.(*sessionFacade)
+	defer f.Close()
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send enter: %v", err)
+	}
+	waitEvent(f.events, 3*time.Second)
+	if err := f.Send(llmwCmd("stop foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send stop: %v", err)
+	}
+	waitEvent(f.events, 3*time.Second)
+	if err := f.Send("y", "", nil, nil); err != nil {
+		t.Fatalf("Send confirm: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已解绑") {
+		t.Fatalf("want unbind after stop, got %q", evStr(ev))
+	}
+	f.Close()
+
+	sess2, _ := a.StartSession(context.Background(), "llmw:foo:")
+	f2 := sess2.(*sessionFacade)
+	defer f2.Close()
+	if err := f2.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := waitEvent(f2.events, 3*time.Second); ev == nil || !contains(ev.Content, "请先 /llmw list") {
+		t.Fatalf("stopped main window must stay unbound, got %q", evStr(ev))
+	}
+}
+
+// Binding-memory lifecycle: entering a different wiki forgets the old
+// facade id; stopping the own suffix window moves the memory to main.
+func TestBindingMemoryLifecycle(t *testing.T) {
+	a, _, _ := newTestAgent(t)
+	sess, _ := a.StartSession(context.Background(), "")
+	f := sess.(*sessionFacade)
+	defer f.Close()
+	enter := func(args string) {
+		t.Helper()
+		if err := f.Send(llmwCmd(args), "", nil, nil); err != nil {
+			t.Fatalf("Send %q: %v", args, err)
+		}
+		if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已进入 wiki") {
+			t.Fatalf("enter %q: want confirmation, got %q", args, evStr(ev))
+		}
+	}
+	enter("enter foo")
+	if !a.bindingRemembered("llmw:foo:") {
+		t.Fatal("enter must remember the binding")
+	}
+	enter("enter bar")
+	if a.bindingRemembered("llmw:foo:") {
+		t.Fatal("switching wikis must forget the old facade id binding")
+	}
+	if !a.bindingRemembered("llmw:bar:") {
+		t.Fatal("switching wikis must remember the new binding")
+	}
+	enter("enter foo tg")
+	if !a.bindingRemembered("llmw:foo:tg") {
+		t.Fatal("suffix enter must remember its binding")
+	}
+	if err := f.Send(llmwCmd("stop foo tg"), "", nil, nil); err != nil {
+		t.Fatalf("Send stop: %v", err)
+	}
+	waitEvent(f.events, 3*time.Second)
+	if err := f.Send("y", "", nil, nil); err != nil {
+		t.Fatalf("Send confirm: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "换绑 main") {
+		t.Fatalf("want suffix-stop rebind notice, got %q", evStr(ev))
+	}
+	if a.bindingRemembered("llmw:foo:tg") {
+		t.Fatal("stopping the suffix window must forget its binding")
+	}
+	if !a.bindingRemembered("llmw:foo:") {
+		t.Fatal("stopping the suffix window must remember the main binding")
+	}
+}
+
+// Regression (2026-09-05): stopping a window that belongs to ANOTHER
+// session's binding must clear that window's binding memory too — a facade
+// closed by /model recycle would otherwise re-enter (and re-CREATE) the
+// window the user stopped. The live-facade ensureInnerLocked rebuild
+// semantic is unchanged.
+func TestStopOtherSessionWindowClearsBindingMemory(t *testing.T) {
+	a, _, _ := newTestAgent(t)
+
+	// Session one binds foo/tg — the binding memory is recorded.
+	sess, _ := a.StartSession(context.Background(), "first")
+	f := sess.(*sessionFacade)
+	defer f.Close()
+	if err := f.Send(llmwCmd("enter foo tg"), "", nil, nil); err != nil {
+		t.Fatalf("Send enter: %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已进入 wiki") {
+		t.Fatalf("want entry confirmation, got %q", evStr(ev))
+	}
+	if !a.bindingRemembered("llmw:foo:tg") {
+		t.Fatal("enter must remember the binding")
+	}
+
+	// A second, unbound session stops that window (default stop branch).
+	sess2, _ := a.StartSession(context.Background(), "second")
+	f2 := sess2.(*sessionFacade)
+	defer f2.Close()
+	if err := f2.Send(llmwCmd("stop foo tg"), "", nil, nil); err != nil {
+		t.Fatalf("Send stop: %v", err)
+	}
+	waitEvent(f2.events, 3*time.Second)
+	if err := f2.Send("y", "", nil, nil); err != nil {
+		t.Fatalf("Send confirm: %v", err)
+	}
+	if ev := waitEvent(f2.events, 3*time.Second); ev == nil || !contains(ev.Content, "主机窗口") {
+		t.Fatalf("want foreign-window stop notice, got %q", evStr(ev))
+	}
+	if a.bindingRemembered("llmw:foo:tg") {
+		t.Fatal("stopping another session's window must clear its binding memory")
+	}
+}
+
 // installCommandFiles: the four menu templates self-install, idempotently
 // refresh a known-legacy llmw.md, and keep user-modified files with a warning.
 func TestInstallCommandFiles(t *testing.T) {
@@ -763,6 +963,7 @@ func TestInstallCommandFiles(t *testing.T) {
 		"llmw_enter.md":  enterMenuCommand,
 		"llmw_abort.md":  abortMenuCommand,
 		"llmw_new.md":    newMenuCommand,
+		"llmw_compact.md": compactMenuCommand,
 	} {
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {

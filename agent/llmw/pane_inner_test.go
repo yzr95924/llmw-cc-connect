@@ -915,6 +915,28 @@ func TestPaneSelfCheck(t *testing.T) {
 	}
 }
 
+// WaitReady absorbs the fresh-window boot race: blank frames first, anchor
+// after → true; a pane that never shows an anchor → false on timeout.
+func TestPaneWaitReady(t *testing.T) {
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.captures = []string{"", "", "idle ctrl+p commands"}
+	r.lastCapture = ""
+	r.mu.Unlock()
+	if !s.WaitReady(5 * time.Second) {
+		t.Fatal("WaitReady must absorb blank boot frames and return true once an anchor appears")
+	}
+
+	s2, r2 := newDriverForTest(t)
+	r2.mu.Lock()
+	r2.captures = []string{"", ""}
+	r2.lastCapture = ""
+	r2.mu.Unlock()
+	if s2.WaitReady(300 * time.Millisecond) {
+		t.Fatal("WaitReady must time out (false) when no anchor ever appears")
+	}
+}
+
 // Abort on an idle pane is a plain error (no keys sent).
 func TestPaneAbortIdle(t *testing.T) {
 	s, r := newDriverForTest(t)
