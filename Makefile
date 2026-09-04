@@ -42,6 +42,11 @@ ALL_EXTRAS    := web
 # lists above never conflict on rebase. Remove this line together with the
 # agent/llmw directory when dropping fork support.
 ALL_AGENTS    += llmw
+# fork addition (binary rename): the fork binary is `llmw-connect` so it can
+# coexist with an upstream cc-connect install on the same machine (npm bin
+# link, PATH, systemd unit). Redefined on its own line for the same
+# rebase-neutral reason; drop together with the rest of the fork.
+APP := llmw-connect
 
 COMMA := ,
 

@@ -135,20 +135,19 @@ printf 'TELEGRAM_BOT_TOKEN=123456:ABC...\n' > /root/.cc-connect/env && chmod 600
 钉钉凭据不走 env——`config.toml` 里 `[[projects.platforms]]` 块配 `client_id` /
 `client_secret`（见上游 `docs/dingtalk.md`）。
 
-**看门狗**（推荐 systemd，单元内容）：
+**看门狗**（推荐 systemd，单元内容；二进制名自 v1.5.0-llmw.4 起为 `llmw-connect`，
+与上游 `cc-connect` 可同机共存）：
 
 ```ini
-# /etc/systemd/system/cc-connect.service
+# /etc/systemd/system/llmw-connect.service
 [Unit]
-Description=cc-connect daemon (llmw pane driver fork)
+Description=llmw-connect daemon (cc-connect llmw pane driver fork)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/root/cc-connect/cc-connect
+ExecStart=/usr/bin/llmw-connect -config /root/.cc-connect/config.toml
 WorkingDirectory=/root
-# systemd system service 不设 HOME，而 byobu/llmw/opencode 都需要它
-# （agent 侧有 passwd 兜底，显式设置最稳）
 Environment="HOME=/root"
 EnvironmentFile=/root/.cc-connect/env
 Restart=always
@@ -159,13 +158,13 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-systemctl daemon-reload && systemctl enable --now cc-connect
-# 之后的部署：make build-noweb VERSION=... && systemctl restart cc-connect
+systemctl daemon-reload && systemctl enable --now llmw-connect
+# 之后的部署：npm install -g @yzr95924/llmw-connect && systemctl restart llmw-connect
 ```
 
 未启用 systemd 时维持手动部署：`set -a; . /root/.cc-connect/env; set +a;
-pkill -9 -x cc-connect; cd /root && setsid nohup /root/cc-connect/cc-connect >
-/tmp/cc-connect-daemon.log 2>&1 < /dev/null &`。**注意**：token 若曾在命令行
+pkill -9 -x llmw-connect; cd /root && setsid nohup llmw-connect >
+/tmp/llmw-connect-daemon.log 2>&1 < /dev/null &`。**注意**：token 若曾在命令行里
 明文出现过（history / 会话记录），建议去 BotFather 轮换一次。多机并存时每机
 独立 bot token（同一 token 被两个 daemon 轮询会互踢丢消息）。
 
@@ -187,7 +186,7 @@ Release 下载对应平台二进制。
 
 ```bash
 npm install -g @yzr95924/llmw-connect
-cc-connect --version
+llmw-connect --version
 ```
 
 前置：GitHub 仓库 secrets 需有 `NPM_TOKEN`（npm 账号 access token）；包为

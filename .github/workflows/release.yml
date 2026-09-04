@@ -65,11 +65,17 @@ jobs:
           draft: false
           prerelease: ${{ contains(env.TAG, '-') }}
           files: |
-            dist/cc-connect-*.tar.gz
-            dist/cc-connect-*.zip
+            dist/llmw-connect-*.tar.gz
+            dist/llmw-connect-*.zip
             dist/checksums.txt
           body: |
             Fork release of cc-connect with the llmw wiki agent.
+
+            Since v1.5.0-llmw.4 the binary is renamed to `llmw-connect` (the
+            npm bin link no longer collides with an upstream cc-connect
+            install). This release also derives HOME for daemon subprocesses
+            (fixes "Cannot run byobu" under systemd) and rolls back phantom
+            wiki bindings on failed enters.
 
             See [npm/README.md](npm/README.md) for what this fork adds, and
             upstream's CHANGELOG.md for the base release contents.
@@ -97,11 +103,14 @@ jobs:
         run: |
           npm pkg set name="@yzr95924/llmw-connect" \
                       version="${TAG#v}" \
+                      bin.llmw-connect=run.js \
                       repository.url="git+https://github.com/yzr95924/llmw-cc-connect.git" \
                       repository.type="git" \
                       homepage="https://github.com/yzr95924/llmw-cc-connect#readme" \
                       bugs.url="https://github.com/yzr95924/llmw-cc-connect/issues" \
-                      description="Fork of cc-connect with llmw wiki agent support (bin: cc-connect)"
+                      description="Fork of cc-connect with llmw wiki agent support (bin: llmw-connect)"
+          # llmw-fork: replace the upstream bin link instead of adding a second one
+          npm pkg delete bin.cc-connect
           cat package.json
 
       - name: Sanity-check injected version matches tag

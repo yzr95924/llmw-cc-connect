@@ -2,6 +2,7 @@
 # Binary outputs
 # ============================================================================
 /cc-connect
+/llmw-connect
 cc-connect.bak-*
 *.exe
 *.exe~

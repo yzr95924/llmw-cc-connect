@@ -4,8 +4,9 @@ Fork of [cc-connect](https://github.com/chenhg5/cc-connect) with first-class sup
 [llmw](https://github.com/yzr95924/llmw-workspace-cli) personal-wiki CLI as an agent backend —
 chat with your llmw wikis from Telegram / DingTalk / WeChat / and every other platform cc-connect bridges.
 
-The binary is still `cc-connect` — same engine, same platforms, plus the `llmw` agent
-(`/llmw list` / `/llmw enter <wiki>` / `/llmw status` / `/llmw stop`).
+The binary is `llmw-connect` (renamed in v1.5.0-llmw.4 so it can coexist with an
+upstream `cc-connect` install on the same machine) — same engine, same platforms,
+plus the `llmw` agent (`/llmw list` / `/llmw enter <wiki>` / `/llmw status` / `/llmw stop`).
 
 ## Install
 
@@ -20,18 +21,18 @@ at install time (same wrapper mechanism as upstream).
 
 ```bash
 # Create config
-cc-connect --version
+llmw-connect --version
 
 # Edit config.toml, then run
-cc-connect
-cc-connect -config /path/to/config.toml
+llmw-connect
+llmw-connect -config /path/to/config.toml
 ```
 
 To use the llmw agent, set in your project config:
 
 ```toml
 agent.type = "llmw"
-agent.options.backend = "claude"   # or "opencode"
+agent.options.backend = "opencode"   # only supported value; may be omitted
 ```
 
 ## Versioning

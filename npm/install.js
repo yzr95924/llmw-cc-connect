@@ -11,7 +11,7 @@ const zlib = require("zlib");
 
 const PACKAGE = require("./package.json");
 const VERSION = `v${PACKAGE.version}`;
-const NAME = "cc-connect";
+const NAME = "llmw-connect"; // llmw-fork: renamed so the npm bin link coexists with upstream cc-connect
 
 const GITHUB_REPO = "yzr95924/llmw-cc-connect";
 
