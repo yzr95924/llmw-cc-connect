@@ -212,14 +212,17 @@ func (f *sessionFacade) ensureInnerLocked() error {
 }
 
 // enterWikiLocked handles first entry and switching; entering the same wiki
-// and suffix again is a no-op with a confirmation reply (idempotent).
+// and suffix again is a no-op with a confirmation reply (idempotent). On a
+// failed enter the numeric selection stays armed, so re-replying the same
+// number retries instead of being told the list expired.
 func (f *sessionFacade) enterWikiLocked(w *wikiEntry, suffix string) {
 	if f.wiki != nil && f.wiki.Name == w.Name && f.suffix == suffix {
 		f.emitLocked("已在 wiki：" + displayWiki(w))
 		return
 	}
-	f.pending = nil
-	f.doEnterLocked(w, suffix, true)
+	if err := f.doEnterLocked(w, suffix, true); err == nil {
+		f.pending = nil
+	}
 }
 
 // enterByNameLocked looks the wiki up in the current workspace and enters it.
@@ -462,13 +465,19 @@ func (f *sessionFacade) handleLlmwCommandLocked(c llmwCommand) {
 //  2. Only when no live window exists: `llmw wiki enter` creates one
 //     (idempotent, daemon-safe), then re-resolve and attach.
 //
-// On failure the facade stays bound with no inner session; the next ordinary
-// message triggers a lazy re-enter. announce=false is the resume path.
-func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool) {
+// On failure the binding is rolled back to what it was before the attempt:
+// an enter of a new wiki must not leave a phantom binding (status would
+// report it, a re-reply of the same number would short-circuit to "已在
+// wiki", and the user would be stuck with a facade that owns no window). The
+// lazy re-enter path is unaffected: there the previous binding IS the same
+// wiki, so "rollback" keeps it and the next message retries. announce=false
+// is the resume path. Returns nil only when a pane session was attached.
+func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool) error {
 	if f.inner != nil {
 		_ = f.inner.Close()
 		f.inner = nil
 	}
+	prevWiki, prevSuffix := f.wiki, f.suffix
 	f.wiki = w
 	f.suffix = suffix
 
@@ -485,19 +494,22 @@ func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool
 		if err != nil {
 			slog.Warn("llmw: wiki enter failed (no window)", "wiki", w.Name, "suffix", suffix, "err", err)
 			f.emitLocked("建立窗口失败：" + err.Error() + "。请检查 byobu/opencode 环境")
-			return
+			f.wiki, f.suffix = prevWiki, prevSuffix
+			return err
 		}
 		row = f.lookupWindowLocked(windowName)
 	}
 	if row == nil {
 		f.emitLocked("窗口 " + windowName + " 未在 llmw status 中出现（可能启动失败）")
-		return
+		f.wiki, f.suffix = prevWiki, prevSuffix
+		return fmt.Errorf("llmw: window %s not found after enter", windowName)
 	}
 
 	root, err := f.a.client.workspaceRoot()
 	if err != nil {
 		f.emitLocked("解析 workspace 根失败：" + err.Error())
-		return
+		f.wiki, f.suffix = prevWiki, prevSuffix
+		return err
 	}
 	workDir := filepath.Join(root, w.Path)
 	target := row.Session + ":" + row.Window
@@ -534,6 +546,7 @@ func (f *sessionFacade) doEnterLocked(w *wikiEntry, suffix string, announce bool
 	if announce {
 		f.emitLocked("✓ 已进入 wiki：" + displayWiki(w) + "（窗口 " + row.Window + "）")
 	}
+	return nil
 }
 
 // SetLiveMode applies a mode change to the running inner pane session (hot

@@ -102,7 +102,9 @@ type realPaneRunner struct {
 }
 
 func (r *realPaneRunner) tmuxOut(args ...string) (string, error) {
-	out, err := exec.Command("tmux", args...).Output()
+	cmd := exec.Command("tmux", args...)
+	applyHomeEnv(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
@@ -111,6 +113,7 @@ func (r *realPaneRunner) tmuxOut(args ...string) (string, error) {
 
 func (r *realPaneRunner) inject(text string) error {
 	cmd := exec.Command("tmux", "load-buffer", "-")
+	applyHomeEnv(cmd)
 	cmd.Stdin = strings.NewReader(text)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("tmux load-buffer: %w", err)
@@ -166,6 +169,7 @@ func runOpencodeDir(ctx context.Context, workDir string, args ...string) (string
 	}
 	defer os.Remove(tmp.Name())
 	c := exec.CommandContext(ctx, "opencode", args...)
+	applyHomeEnv(c) // opencode reads ~/.config/opencode
 	c.Dir = workDir
 	var errb bytes.Buffer
 	c.Stdout = tmp

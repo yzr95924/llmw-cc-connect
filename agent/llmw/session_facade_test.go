@@ -423,6 +423,107 @@ func TestFacadeEnterByNameAndSwitch(t *testing.T) {
 	}
 }
 
+// Regression (2026-09-04, "llmw_list 后回复数字报错"): when llmw wiki enter
+// fails (e.g. byobu refusing to run under a HOME-less daemon env), the
+// facade used to keep the phantom binding — status showed a bound wiki, a
+// re-reply of the same number short-circuited to "已在 wiki", and the user
+// was stuck. After a failed enter the binding must roll back to unbound AND
+// the numeric selection must stay armed so the same number retries.
+func TestFacadeEnterFailureRollsBackAndRearms(t *testing.T) {
+	a, runner, panes := newTestAgent(t)
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	// /llmw list arms the numeric selection (foo=1, bar=2).
+	if err := f.Send(llmwCmd("list"), "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "1. foo") {
+		t.Fatalf("want wiki listing, got %q", evStr(ev))
+	}
+
+	// Make `llmw wiki enter` fail the way the real incident did.
+	runner.mu.Lock()
+	runner.errFor = map[string]string{
+		"wiki": "llmw wiki enter: exit status 2: byobu: Cannot run byobu because [root] does not own []",
+	}
+	runner.mu.Unlock()
+
+	if err := f.Send("1", "", nil, nil); err != nil {
+		t.Fatalf("Send 1: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "建立窗口失败") {
+		t.Fatalf("want enter failure notice, got %q", evStr(ev))
+	}
+	f.mu.Lock()
+	bound := f.wiki != nil
+	f.mu.Unlock()
+	if bound {
+		t.Fatal("failed enter must roll the binding back (no phantom binding)")
+	}
+
+	// The selection stays armed: after the failure is fixed, the SAME number
+	// retries the enter instead of falling through as a chat message.
+	runner.mu.Lock()
+	runner.errFor = nil
+	runner.mu.Unlock()
+	if err := f.Send("1", "", nil, nil); err != nil {
+		t.Fatalf("Send 1 (retry): %v", err)
+	}
+	if ev := waitEvent(f.events, 3*time.Second); ev == nil || !contains(ev.Content, "已进入 wiki：foo") {
+		t.Fatalf("want entry on numeric retry, got %q", evStr(ev))
+	}
+	if _, ok := panes["foo"]; !ok {
+		t.Fatal("pane for foo not attached after retry")
+	}
+}
+
+// A failed SWITCH of an already-bound facade (numeric reply to /llmw switch)
+// must restore the previous binding, not leave the new wiki half-bound.
+func TestFacadeSwitchFailureRestoresBinding(t *testing.T) {
+	a, runner, _ := newTestAgent(t)
+	runner.mu.Lock()
+	runner.windows = []windowRow{
+		{Wiki: "foo", Window: "foo-main", WindowID: "@f0", Session: "llm_workspace", Backend: "opencode", State: "waiting"},
+		{Wiki: "bar", Window: "bar-tg", WindowID: "@b1", Session: "llm_workspace", Backend: "opencode", State: "waiting"},
+	}
+	runner.mu.Unlock()
+	f := newFacadeForTest(a)
+	defer f.Close()
+
+	// Enter foo first (live window: attach, no llmw enter call).
+	if err := f.Send(llmwCmd("enter foo"), "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "已进入 wiki：foo") {
+		t.Fatalf("want entry foo, got %q", evStr(ev))
+	}
+
+	// bar-tg is a LIVE window: the switch path attaches without calling
+	// `llmw wiki enter`, so the failure has to come from a later step —
+	// make workspace resolution explode (the rollback is what matters).
+	if err := f.Send(llmwCmd("switch"), "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "切换主机窗口") {
+		t.Fatalf("want window listing, got %q", evStr(ev))
+	}
+	a.client.root = func() (string, error) { return "", errFake("workspace gone") }
+
+	if err := f.Send("2", "", nil, nil); err != nil {
+		t.Fatalf("Send 2: %v", err)
+	}
+	if ev := waitEvent(f.events, time.Second); ev == nil || !contains(ev.Content, "解析 workspace 根失败") {
+		t.Fatalf("want failure notice, got %q", evStr(ev))
+	}
+	f.mu.Lock()
+	wiki := f.wiki
+	f.mu.Unlock()
+	if wiki == nil || wiki.Name != "foo" {
+		t.Fatalf("failed switch must restore the foo binding, got %+v", wiki)
+	}
+}
+
 func TestFacadeUnknownWiki(t *testing.T) {
 	a, _, _ := newTestAgent(t)
 	f := newFacadeForTest(a)

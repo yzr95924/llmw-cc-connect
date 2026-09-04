@@ -77,6 +77,13 @@ backend = "opencode"   # 唯一合法值（省略即默认）；写别的值启�
 
 - `llmw` 在 PATH（`llmw list --json` 可用）；workspace 根 = `$LLMW_WORKSPACE` 或
   `~/yzr-llm-wiki-workspace`（需含 `workspace.toml`）。
+- **daemon 环境必须有 `HOME`**（systemd system service 默认只给 `USER` 不给
+  `HOME`）：byobu 启动器要求当前用户 own `$HOME`，`HOME` 为空时直接拒绝——
+  症状是 IM 回复序号进入 wiki 报
+  `Cannot run byobu because [root] does not own []`（`llmw list`/`status` 不经
+  byobu，照常工作）。agent 侧已兜底（子进程 HOME 为空时从 passwd 推导，
+  `agent/llmw/env.go`），但仍建议 unit/env 文件显式设 `HOME`。手动部署路径
+  （登录 shell 启动）天然有 HOME，不受影响。
 - `enter_byobu=true`（`workspace_local.toml`）：IM `/llmw enter` 与主机
   `llmw wiki enter` 走同一命令，窗口天然共享。
 - `opencode` ≥ 1.18 在 PATH（`opencode session list --format json` / `opencode export`）。
@@ -140,6 +147,9 @@ Wants=network-online.target
 [Service]
 ExecStart=/root/cc-connect/cc-connect
 WorkingDirectory=/root
+# systemd system service 不设 HOME，而 byobu/llmw/opencode 都需要它
+# （agent 侧有 passwd 兜底，显式设置最稳）
+Environment="HOME=/root"
 EnvironmentFile=/root/.cc-connect/env
 Restart=always
 RestartSec=3
@@ -223,6 +233,7 @@ go test -tags live -run TestLivePaneSmoke -v -timeout 600s ./agent/llmw/
 | 症状 | 检查 |
 | --- | --- |
 | `/llmw list` / `/llmw status` 报 "llmw 不可用" | `which llmw`；`llmw list --json` 手动跑；`$LLMW_WORKSPACE` 是否指向含 workspace.toml 的目录 |
+| 回复序号进入报 `建立窗口失败 … Cannot run byobu because [root] does not own []` | daemon 环境 `HOME` 缺失（`tr '\0' '\n' < /proc/$(pgrep -x cc-connect)/environ \| grep ^HOME=`）；unit/env 文件补 `HOME=/root` 后 restart。旧版本还会留下假绑定（status 显示已绑定、再回数字提示"已在 wiki"）——升级到带回滚的版本或 `/llmw_detach` 解掉 |
 | 进入报 "agent 不可用" | `which opencode`；`opencode --version`；主机 `llmw wiki --name=X enter` 手动跑看报错 |
 | 消息发出无回复 | `llmw status` 看窗口 state；cc-connect 日志 grep `llmw pane`；窗口是否被主机占用（busy 闸门会拒发） |
 | 回复"会话末尾不是本回合输入" | 主机在共享窗口插话触发 sticky echo 防错发保护；稍后重发即可 |

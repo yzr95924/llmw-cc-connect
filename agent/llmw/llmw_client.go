@@ -76,6 +76,7 @@ func newLlmwClient() *llmwClient {
 
 func (c *llmwClient) runReal(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, llmwBin, args...)
+	applyHomeEnv(cmd) // byobu under llmw refuses to run without $HOME
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
@@ -97,9 +98,9 @@ func (c *llmwClient) workspaceRoot() (string, error) { return c.root() }
 func (c *llmwClient) workspaceRootReal() (string, error) {
 	root := os.Getenv("LLMW_WORKSPACE")
 	if root == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("llmw: cannot resolve home dir: %w", err)
+		home := homeDirEnv() // os.UserHomeDir fails when HOME is unset (systemd)
+		if home == "" {
+			return "", fmt.Errorf("llmw: cannot resolve home dir (HOME unset, no passwd entry)")
 		}
 		root = filepath.Join(home, defaultWorkspace)
 	}
