@@ -25,13 +25,37 @@ opencode 上）；`backend` option 写其他值会在启动时显式报错。
   `△ Always allow` / `Confirm / Cancel` 第二页（Confirm 预选中）——按键序列为
   Right+Enter，停 600ms，再 Enter 确认。第二页计入 busy 并集（锚点
   `This will allow the following patterns`），否则回合会被误判提前结束。
-- **question 工具弹窗（L1，2026-08-30 实机探测）**：agent 用 question 工具提问时 TUI 弹
-  模态选择框（问题 + `N.` 编号选项 + `Type your own answer` + footer `⇆ select / enter
-  submit / esc dismiss`）。检测锚点 = footer 三词同行；弹窗计入 busy 并集（不误判回合
-  结束、不注入按键——防输入污染），每个弹窗发一次 IM 通知（含问题预览），**回答在主机
-  窗口操作**，完成后回合自动继续。上游 headless 对接（`opencode run`）无此问题——无
-  TUI 即无弹窗，question 工具直接失败。L2（IM 序号回答：解析选项 → 回复数字 →
-  Down×N+Enter）为未来工作。
+- **question 工具弹窗（L2 按钮卡，2026-09-05 升级）**：agent 用 question 工具提问时
+  TUI 弹模态选择框。pane 解析当前页（问题 + `N.` 编号选项 + 可选缩进描述行 +
+  `Type your own answer` 入口）并作为 `AskUserQuestion` permission request 发给引擎
+  ——IM 出**原生按钮卡**，点按钮 / 回复数字 / 回复自由文本皆可（引擎 `resolveAskQuestionAnswer`
+  统一解析）；答案经 `RespondPermission` 注键回 TUI：匹配选项标签 → 发**数字键**
+  （数字键即选中即确认——2026-09-05 探测，比 Down×N+Enter 可靠）；不匹配 → 走
+  "Type your own answer" 入口（数字开输入框 → bracketed paste → Enter，paste+中文
+  已实测）。**为什么走 permission 通道而非普通消息**：回合进行中引擎把普通消息排
+  队、把命令拒掉（"上一条正在处理"），二者都到不了 pane；pending permission 拦截
+  在会话锁之前（engine.go:2966），按钮回调是唯一活动通道。**多问题表单**：逐 tab
+  发卡（每页一个 request，答完自动跳下一 tab——探测实证），末页 Confirm（footer 无
+  `select`，`paneBusy` 并集防误判回合结束）由 pane 自动 Enter 提交。**解析失败降级**
+  L1：发文本通知（含问题预览）请到主机窗口操作。**弹窗块是结构性收紧的**（2026-09-05
+  事故 redesign）：从 footer 向上走——跳过 chrome 行（workdir/分支状态，≤3 行）→ 连续
+  选项区（选项行 + 悬挂其下的描述行，遇空行止）→ 跳一空行 → 问题文本行（遇空行止）——
+  busy 窗口里弹窗上方是流式会话文本，其编号列表行会被 `N. ` 正则误认为选项、分支状态行
+  （"master"）会浮成问题文本（两形态均为 2026-09-05 生产事故实测）；空行边界把对话区
+  垃圾天然隔在块外；解析另有**契约校验**——无 "Type your own answer" 入口的块一律拒析
+  （真实弹窗恒有该入口，探测证实）→ 降级 L1 通知，垃圾卡片封死。**数字键只对 1-9 成立**：
+  选项序号 ≥10 时明确报错"请到主机窗口操作"而非发送两位数字（首位数字会立即选中选项 1
+  并自动确认——静默答错是最坏失败模式，宁可不注入）。Confirm 页自动 Enter 失败会在下一
+  tick 重试（不置位不放弃），且与其它注键同走 `injectMu`。**问题文本定位同结构性**（选项块
+  上方整段连续非空行，换行问题拼接显示）；**fingerprint 只
+  hash 解析后的问题+选项标签**，不 hash 原始块。**弹窗在主机侧被答掉/关掉时**，
+  已发出的 IM 卡成为孤儿——引擎 pending 挂起阻塞回合，直到下一条 IM 消息被当作它的答案
+  消费掉（引擎行为，agent 侧无法主动 resolve）；pane 会打 warn 日志（"gone without IM
+  answer"）标记这一状态。上游 headless 对接（`opencode run`）
+  无此问题——无 TUI 即无弹窗，question 工具直接失败。按键契约（2026-09-05 探测，
+  opencode 1.18.28）：单问 footer `↑↓ select enter submit esc dismiss`；多问页
+  footer `⇆ tab ↑↓ select enter confirm esc dismiss` + 顶部 tab 条；Confirm 页
+  footer `⇆ tab enter submit esc dismiss`；初始光标=选项 1。
 - 会话是**稳定 facade**：wiki 切换时换 pane，对外事件通道不变；agent session ID
   编码为 `llmw:<wiki>:<pane>`。**绑定永远显式**：llmw-connect daemon 重启（含部署）后 facade
   重建为未绑定态，需 `/llmw enter`（或 `/llmw switch` → 序号）重新接入——StartSession
@@ -137,10 +161,10 @@ backend = "opencode"   # 唯一合法值（省略即默认）；写别的值启�
 - 权限弹窗依赖 TUI 文案契约（`Permission required` / `Allow once`），opencode
   大版本改版需重新探测按键语义。
 - Web 管理界面的 agent 下拉框不含 "llmw"（fork 按 `build-noweb` 构建，web 整体不启用）。
-- **单平台假设（2026-09-05 审计）**：pane `SetLiveModel` / `SetLiveMode` 无互斥锁
-  ——当前唯一平台 telegram 的 poll 循环顺序处理消息，天然串行；若未来接入第二平台
-  （钉钉等），两平台并发 `/model` 会交错注入 TUI 按键（模型对话框状态错乱，可被
-  下一次 `/model` 自愈）。接入新平台前需先给这两个方法加锁。
+- **单平台串行假设已封口（2026-09-05）**：pane `injectMu` 互斥锁串行化全部多步注键
+  序列（Send 的 inject+submit、Abort 的 ESC、权限/question 弹窗应答、SetLiveMode /
+  SetLiveModel 对话框交互）——第二平台或回调与消息并发时注键不再交错；capture-only
+  路径（轮询、自检、GetPane*）不加锁。
 
 ## 运维
 
@@ -245,10 +269,13 @@ go test -tags live -run TestLivePaneSmoke -v -timeout 600s ./agent/llmw/
 红了再看锚点细节。TUI 屏幕文本锚点（大版本改版需重新探测，锚点定义都在
 `pane_inner.go` 顶部常量/注释）：`esc interrupt`（busy）、`Permission required` /
 `Allow once`（权限页 1）、`This will allow the following patterns`（权限页 2）、
-`⇆ select / enter submit / esc dismiss`（question 弹窗）、`Select model`（模型
+`↑↓ select / enter submit（或 enter confirm）/ esc dismiss`（question 弹窗——
+多问题页是 enter confirm）、`⇆ tab enter submit esc dismiss` 且无 select
+（多问题 Confirm 页，pane 自动提交）、`Select model`（模型
 对话框）、`Build · <model>`（底栏）。单元测试只喂合成帧、升级时不红——live 冒烟
 才是对真实 TUI 的把关。人工冒烟（冒烟测试没覆盖的部分）：`/model` 切换、
-`/llmw_abort` 中止、点一次 Allow always（两级确认）。任一行为异常即重新沙盒探测
+`/llmw_abort` 中止、点一次 Allow always（两级确认）、**触发一次 question 工具**
+（按钮卡出现 → 点选项 / 回数字 / 回自由文本三种路径各验一次）。任一行为异常即重新沙盒探测
 （`tmux new-session -d -s llmwprobe -c /tmp/opencode/probe 'opencode'`，勿碰生产窗口）。
 
 ## 故障排查
@@ -260,4 +287,5 @@ go test -tags live -run TestLivePaneSmoke -v -timeout 600s ./agent/llmw/
 | 进入报 "agent 不可用" | `which opencode`；`opencode --version`；主机 `llmw wiki --name=X enter` 手动跑看报错 |
 | 消息发出无回复 | `llmw status` 看窗口 state；llmw-connect 日志（`journalctl -u llmw-connect`）grep `llmw pane`；窗口是否被主机占用（busy 闸门会拒发） |
 | 回复"会话末尾不是本回合输入" | 主机在共享窗口插话触发 sticky echo 防错发保护；稍后重发即可 |
+| **IM 卡住不回、卡片点了没反应**（2026-09-05 实测） | 先看 journalctl 有无 `gone without IM answer` warn——question 弹窗在主机侧被答掉后，IM 孤儿卡挂起引擎 pending。**恢复：IM 随便发一条消息**（会被当作该卡的答案消费、resolve pending、回合解锁，不会重复执行）；仍不行 `systemctl restart llmw-connect` + `/llmw_enter`。若 journal 同一弹窗连续多条 `permission request` 不同 id = fingerprint 漂移（旧版缺陷，v1.5.0-llmw.6 已修——升级二进制） |
 | 权限按钮点了没反应 | 看窗口弹窗是否已被主机手动回答（此时 IM 按钮变 no-op 属预期） |

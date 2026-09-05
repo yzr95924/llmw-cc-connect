@@ -955,14 +955,14 @@ func TestInstallCommandFiles(t *testing.T) {
 	}
 	dir := a.commandsDir
 	for name, want := range map[string]string{
-		"llmw.md":        menuCommand,
-		"llmw_list.md":   listMenuCommand,
-		"llmw_switch.md": switchMenuCommand,
-		"llmw_stop.md":   stopMenuCommand,
-		"llmw_detach.md": detachMenuCommand,
-		"llmw_enter.md":  enterMenuCommand,
-		"llmw_abort.md":  abortMenuCommand,
-		"llmw_new.md":    newMenuCommand,
+		"llmw.md":         menuCommand,
+		"llmw_list.md":    listMenuCommand,
+		"llmw_switch.md":  switchMenuCommand,
+		"llmw_stop.md":    stopMenuCommand,
+		"llmw_detach.md":  detachMenuCommand,
+		"llmw_enter.md":   enterMenuCommand,
+		"llmw_abort.md":   abortMenuCommand,
+		"llmw_new.md":     newMenuCommand,
 		"llmw_compact.md": compactMenuCommand,
 	} {
 		data, err := os.ReadFile(filepath.Join(dir, name))

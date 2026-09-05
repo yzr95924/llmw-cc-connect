@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -556,10 +557,38 @@ func questionDialogFrame(question string, opts ...string) string {
 	for i, o := range opts {
 		b += "  ┃  " + strconv.Itoa(i+1) + ". " + o + "\n"
 	}
-	b += "  ┃  3. Type your own answer\n"
+	b += "  ┃  " + strconv.Itoa(len(opts)+1) + ". Type your own answer\n"
 	b += "  ┃                                                                  /tmp/opencode/probe\n"
 	b += "  ┃  ⇆ select  enter submit  esc dismiss\n"
 	return b
+}
+
+// multiQuestionFrame renders a tabbed page (tab strip above the question)
+// with the multi-question footer, probed 2026-09-05.
+func multiQuestionFrame(tabs string, question string, opts ...string) string {
+	b := "  ┃\n"
+	b += "  ┃  " + tabs + "\n"
+	b += "  ┃\n"
+	b += "  ┃  " + question + "\n"
+	b += "  ┃\n"
+	for i, o := range opts {
+		b += "  ┃  " + strconv.Itoa(i+1) + ". " + o + "\n"
+	}
+	b += "  ┃  " + strconv.Itoa(len(opts)+1) + ". Type your own answer\n"
+	b += "  ┃  ⇆ tab  ↑↓ select  enter confirm  esc dismiss\n"
+	return b
+}
+
+// confirmPageFrame renders the multi-question Review page (no "select" in
+// the footer — that is what distinguishes it from a question page).
+func confirmPageFrame() string {
+	return "  ┃\n" +
+		"  ┃   Beverage   Sugar   Confirm\n" +
+		"  ┃\n" +
+		"  ┃  Review\n" +
+		"  ┃  Beverage: coffee\n" +
+		"  ┃  Sugar: yes\n" +
+		"  ┃  ⇆ tab  enter submit  esc dismiss\n"
 }
 
 // extractQuestionDialog: positive (footer anchor), negatives (permission
@@ -633,6 +662,7 @@ func TestPaneQuestionDialogNotifiesOnce(t *testing.T) {
 	}
 	var notes, texts []string
 	var reqs int
+	var req *core.Event
 	deadline := time.After(3 * time.Second)
 	done := false
 	for !done {
@@ -641,6 +671,8 @@ func TestPaneQuestionDialogNotifiesOnce(t *testing.T) {
 			switch ev.Type {
 			case core.EventPermissionRequest:
 				reqs++
+				c := ev
+				req = &c
 			case core.EventText:
 				if strings.Contains(ev.Content, "等待选择") {
 					notes = append(notes, ev.Content)
@@ -654,17 +686,482 @@ func TestPaneQuestionDialogNotifiesOnce(t *testing.T) {
 			t.Fatal("no result event within timeout")
 		}
 	}
-	if len(notes) != 1 {
-		t.Fatalf("question notifications = %d, want exactly 1 (deduped): %q", len(notes), notes)
+	if reqs != 1 {
+		t.Fatalf("question dialog must emit exactly 1 AskUserQuestion request, got %d", reqs)
 	}
-	if !strings.Contains(notes[0], "coffee or tea?") || !strings.Contains(notes[0], "主机窗口") {
-		t.Fatalf("notification = %q, want question preview + host guidance", notes[0])
+	if req == nil || req.ToolName != "AskUserQuestion" || len(req.Questions) != 1 {
+		t.Fatalf("request = %+v, want AskUserQuestion with one question", req)
 	}
-	if reqs != 0 {
-		t.Fatalf("question dialog must not emit permission requests, got %d", reqs)
+	q := req.Questions[0]
+	if q.Question != "coffee or tea?" || len(q.Options) != 2 ||
+		q.Options[0].Label != "coffee" || q.Options[1].Label != "tea" {
+		t.Fatalf("question = %+v, want coffee/tea options without the free-text entry", q)
+	}
+	if len(notes) != 0 {
+		t.Fatalf("parseable dialog must not fall back to the L1 notice: %q", notes)
 	}
 	if !strings.Contains(strings.Join(texts, ""), "done") {
 		t.Fatalf("texts = %q, want the reply delivered after host answer", texts)
+	}
+}
+
+// A question dialog whose page cannot be parsed (no option rows) degrades
+// to the L1 host-window notice — never a broken button card.
+func TestPaneQuestionDialogParseFailureFallsBack(t *testing.T) {
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_q2", Directory: "/ws/foo", Updated: 9000}})
+	e := ocExport{}
+	e.Messages = append(e.Messages, ocMsg("user", "hi"), ocMsg("assistant", "done"))
+	r.exports["ses_q2"] = marshalExport(t, e)
+	frame := "  ┃\n  ┃  odd dialog without options\n  ┃  ⇆ select  enter submit  esc dismiss\n"
+	r.captures = []string{
+		"idle ctrl+p",
+		"working esc interrupt",
+		frame,
+		frame,
+		"working esc interrupt",
+		"idle ctrl+p",
+		"idle ctrl+p",
+	}
+	r.mu.Unlock()
+
+	if err := s.Send("hi", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	var notes []string
+	deadline := time.After(3 * time.Second)
+	done := false
+	for !done {
+		select {
+		case ev := <-s.Events():
+			switch ev.Type {
+			case core.EventPermissionRequest:
+				t.Fatalf("unparseable dialog must not emit a request: %+v", ev)
+			case core.EventText:
+				if strings.Contains(ev.Content, "等待选择") {
+					notes = append(notes, ev.Content)
+				}
+			case core.EventResult:
+				done = ev.Done
+			}
+		case <-deadline:
+			t.Fatal("no result event within timeout")
+		}
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "主机窗口") {
+		t.Fatalf("fallback notes = %q, want the L1 host guidance", notes)
+	}
+}
+
+// questionFingerprint stability (2026-09-05 incident): the fingerprint is
+// derived from the parsed question+labels, so volatile rows inside the
+// 20-line block window (streaming text, spinners, "master" branch rows)
+// must NOT change it; different options must.
+func TestQuestionFingerprintStable(t *testing.T) {
+	base := questionDialogFrame("coffee or tea?", "coffee", "tea")
+	// Same dialog, volatile rows above and below drifted.
+	drifted := "  ┃  ⠋ thinking about it…\n" + base +
+		"  ┃  master\n  ┃  ⠙ more spinner\n"
+	if questionFingerprint(base) != questionFingerprint(drifted) {
+		t.Fatal("volatile rows inside the block must not change the fingerprint")
+	}
+	if questionFingerprint(base) == questionFingerprint(questionDialogFrame("coffee or tea?", "coffee", "chocolate")) {
+		t.Fatal("different option labels must change the fingerprint")
+	}
+	if questionFingerprint(base) == questionFingerprint(questionDialogFrame("tea or coffee?", "coffee", "tea")) {
+		t.Fatal("different question text must change the fingerprint")
+	}
+}
+
+// questionPreview is structural (2026-09-05 incident): the question line
+// directly above the option block wins over keyword heuristics — a bare
+// "master" git-branch row below the options must never surface, and junk
+// streamed above the question must not either.
+func TestQuestionPreviewStructural(t *testing.T) {
+	frame := "  ┃  ⠋ processing… 42%  $0.03\n" +
+		"  ┃\n" +
+		"  ┃  coffee 还是 tea？\n" +
+		"  ┃\n" +
+		"  ┃  1. coffee\n" +
+		"  ┃     coffee\n" +
+		"  ┃  2. tea\n" +
+		"  ┃     tea\n" +
+		"  ┃  3. Type your own answer\n" +
+		"  ┃  master\n" +
+		"  ┃  ⇆ select  enter submit  esc dismiss\n"
+	if got := questionPreview(frame); got != "coffee 还是 tea？" {
+		t.Fatalf("preview = %q, want the structural question line", got)
+	}
+	// Multi-question strip: the tab strip is skipped, current tab's
+	// question wins.
+	mq := multiQuestionFrame(" Beverage   Sugar   Confirm", "sugar, yes or no?", "yes", "no")
+	if got := questionPreview(mq); got != "sugar, yes or no?" {
+		t.Fatalf("multi-question preview = %q", got)
+	}
+}
+
+// The 2026-09-05 production incident, replayed: a busy pane streams
+// numbered-list conversation text above the dialog (the incident parsed
+// "2. Stable fingerprint -> injection works" as an option) and a bare
+// "master" branch-status row sits in the dialog chrome. The tight
+// structural block must exclude both.
+func TestExtractQuestionDialogTightBlock(t *testing.T) {
+	cap := "  ┃  Thought: 471ms\n" +
+		"  ┃  Let me verify the fixes:\n" +
+		"  ┃  1. card question text correct\n" +
+		"  ┃  2. stable fingerprint -> injection works\n" +
+		"  ┃  3. turn completes\n" +
+		"  ┃\n" +
+		"  ┃  coffee 还是 tea？（第三轮复测）\n" +
+		"  ┃\n" +
+		"  ┃  1. coffee\n" +
+		"  ┃     coffee\n" +
+		"  ┃  2. tea\n" +
+		"  ┃     tea\n" +
+		"  ┃  3. Type your own answer\n" +
+		"  ┃  master\n" +
+		"  ┃  ↑↓ select  enter submit  esc dismiss\n"
+	block, ok := extractQuestionDialog(cap)
+	if !ok {
+		t.Fatal("dialog not detected under streamed junk")
+	}
+	q, nums, freeIdx, ok := parseQuestionPage(block)
+	if !ok {
+		t.Fatalf("parse failed on tight block: %q", block)
+	}
+	if len(q.Options) != 2 || q.Options[0].Label != "coffee" || q.Options[1].Label != "tea" {
+		t.Fatalf("options = %+v — streamed numbered lines leaked in", q.Options)
+	}
+	if len(nums) != 2 || nums[0] != 1 || nums[1] != 2 || freeIdx != 3 {
+		t.Fatalf("nums = %v free = %d", nums, freeIdx)
+	}
+	if q.Question != "coffee 还是 tea？（第三轮复测）" {
+		t.Fatalf("question = %q — chrome/status rows leaked in", q.Question)
+	}
+	// Fingerprint only sees the stable fields, so the junk above never
+	// mattered for it — but assert it end-to-end anyway.
+	if strings.Contains(questionFingerprint(block), "master") {
+		t.Fatal("unreachable: fp is a hash")
+	}
+}
+
+// F2 (2026-09-05 review): digit keys only exist for 1-9 — answering the
+// 10th option must degrade to an explicit error, never sendText("10")
+// (the leading "1" would select option 1 AND auto-confirm silently).
+func TestRespondQuestionBeyondNineOptions(t *testing.T) {
+	s, r := newDriverForTest(t)
+	opts := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	frame := questionDialogFrame("pick one", opts...)
+	r.mu.Lock()
+	r.captures = []string{frame}
+	r.mu.Unlock()
+	block, _ := extractQuestionDialog(frame)
+	fp := questionFingerprint(block)
+
+	err := s.RespondPermission(fp, core.PermissionResult{
+		Behavior:     "allow",
+		UpdatedInput: map[string]any{"answers": map[string]any{"pick one": "j"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "主机窗口") {
+		t.Fatalf("want out-of-range degradation error, got %v", err)
+	}
+	if len(r.SentTexts()) != 0 || r.containsKey("Enter") {
+		t.Fatal("out-of-range answer must inject nothing")
+	}
+}
+
+// F3 (2026-09-05 review): a footer-matched span block whose "options" are
+// conversation junk (numbered-list text, no "Type your own answer" entry)
+// must NOT parse into a card — real dialogs always carry the free-text
+// entry (probed contract). The caller degrades to the L1 notice.
+func TestParseQuestionPageRejectsJunkWithoutFreeEntry(t *testing.T) {
+	junk := "  ┃  1. first fix applied\n" +
+		"  ┃  2. stable fingerprint\n" +
+		"  ┃  3. turn completes\n" +
+		"  ┃\n" +
+		"  ┃  ⇆ select  enter submit  esc dismiss\n"
+	if _, _, _, ok := parseQuestionPage(junk); ok {
+		t.Fatal("junk numbered lines without the free-text entry must not parse")
+	}
+	// Detection still fires (paneBusy relies on it) — the block is the
+	// span fallback, parsing is what rejects it.
+	if _, ok := extractQuestionDialog(junk); !ok {
+		t.Fatal("footer detection must still fire for busy-union purposes")
+	}
+}
+
+// F5 (2026-09-05 review): wrapped questions join into one preview line.
+func TestQuestionPreviewWrappedQuestion(t *testing.T) {
+	frame := "  ┃  这个问题非常长以至于在窗口里\n" +
+		"  ┃  折成了两行显示\n" +
+		"  ┃\n" +
+		"  ┃  1. yes\n" +
+		"  ┃  2. no\n" +
+		"  ┃  3. Type your own answer\n" +
+		"  ┃  ⇆ select  enter submit  esc dismiss\n"
+	if got := questionPreview(frame); got != "这个问题非常长以至于在窗口里 折成了两行显示" {
+		t.Fatalf("preview = %q, want the joined wrapped lines", got)
+	}
+}
+
+// Regression (2026-09-05 production trace, round 5): after an IM answer
+// injects the digit, the TUI dismiss animation lingers ~2s — the poll
+// loop re-detected the same stable fingerprint and RE-EMITTED a duplicate
+// card, which then orphaned (false "gone without IM answer" warn). The
+// answered dialog keeps its fingerprint (dedup holds) and the gone-branch
+// must not treat it as an orphan.
+func TestNoReemitAfterIMAnswer(t *testing.T) {
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_nr", Directory: "/ws/foo", Updated: 9000}})
+	e := ocExport{}
+	e.Messages = append(e.Messages, ocMsg("user", "hi"), ocMsg("assistant", "done"))
+	r.exports["ses_nr"] = marshalExport(t, e)
+	frame := questionDialogFrame("coffee or tea?", "coffee", "tea")
+	r.captures = []string{
+		"idle ctrl+p",
+		"working esc interrupt",
+		frame,
+		frame,
+		frame, // dismiss animation lingers
+		frame,
+		"idle ctrl+p",
+		"idle ctrl+p",
+	}
+	r.mu.Unlock()
+
+	if err := s.Send("hi", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// Wait for the card, answer it, then count total requests until the
+	// turn completes — exactly one must have been emitted.
+	var reqs int
+	var fp string
+	deadline := time.After(3 * time.Second)
+	done := false
+	for !done {
+		select {
+		case ev := <-s.Events():
+			switch ev.Type {
+			case core.EventPermissionRequest:
+				reqs++
+				fp = ev.RequestID
+				// Answer as soon as the card is out (engine side would).
+				if err := s.RespondPermission(fp, core.PermissionResult{
+					Behavior:     "allow",
+					UpdatedInput: map[string]any{"answers": map[string]any{"coffee or tea?": "tea"}},
+				}); err != nil {
+					t.Fatalf("RespondPermission: %v", err)
+				}
+			case core.EventResult:
+				done = ev.Done
+			}
+		case <-deadline:
+			t.Fatal("no result event within timeout")
+		}
+	}
+	if reqs != 1 {
+		t.Fatalf("requests = %d, want exactly 1 (no re-emit during dismiss animation)", reqs)
+	}
+	if got := r.SentTexts(); !reflect.DeepEqual(got, []string{"2"}) {
+		t.Fatalf("sentTexts = %v, want the single answer digit", got)
+	}
+	// And the markers are clean after the dialog is gone.
+	if fpA, answered := s.qState(); fpA != "" || answered {
+		t.Fatalf("qState = (%q, %v), want cleared after dialog gone", fpA, answered)
+	}
+}
+
+// parseQuestionPage: option labels, TUI digits, free-text entry index,
+// description rows, the multi-question tab strip, and the no-options
+// negative (probed layout 2026-09-05, opencode 1.18.28).
+func TestParseQuestionPage(t *testing.T) {
+	block, ok := extractQuestionDialog(questionDialogFrame("coffee or tea?", "coffee", "tea"))
+	if !ok {
+		t.Fatal("frame not detected")
+	}
+	q, nums, freeIdx, ok := parseQuestionPage(block)
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	if q.Question != "coffee or tea?" {
+		t.Fatalf("question = %q", q.Question)
+	}
+	if len(q.Options) != 2 || q.Options[0].Label != "coffee" || q.Options[1].Label != "tea" {
+		t.Fatalf("options = %+v (free-text entry must be excluded)", q.Options)
+	}
+	if len(nums) != 2 || nums[0] != 1 || nums[1] != 2 {
+		t.Fatalf("nums = %v, want TUI digits [1 2]", nums)
+	}
+	if freeIdx != 3 {
+		t.Fatalf("freeIdx = %d, want 3", freeIdx)
+	}
+
+	// Multi-question page: tab strip above the question is not mistaken
+	// for content; the footer says "enter confirm" instead of "submit".
+	mblock, ok := extractQuestionDialog(multiQuestionFrame(" Beverage   Sugar   Confirm", "sugar, yes or no?", "yes", "no"))
+	if !ok {
+		t.Fatal("multi-question frame not detected")
+	}
+	mq, mnums, mfree, ok := parseQuestionPage(mblock)
+	if !ok || mq.Question != "sugar, yes or no?" || len(mq.Options) != 2 {
+		t.Fatalf("multi-question parse = %+v ok=%v", mq, ok)
+	}
+	if mnums[0] != 1 || mnums[1] != 2 || mfree != 3 {
+		t.Fatalf("multi nums = %v free = %d", mnums, mfree)
+	}
+
+	// No option rows → not parseable (caller falls back to the L1 notice).
+	if _, _, _, ok := parseQuestionPage("  ┃  no options here\n  ┃  ⇆ select  enter submit  esc dismiss\n"); ok {
+		t.Fatal("no-option page must not parse")
+	}
+}
+
+// paneBusy: the Confirm page (footer without "select") keeps the turn
+// busy; a question footer with "select" is not misread as a confirm page.
+func TestPaneBusyConfirmPage(t *testing.T) {
+	if !isQuestionConfirmPage(confirmPageFrame()) {
+		t.Fatal("confirm page not detected")
+	}
+	if !paneBusy(confirmPageFrame()) {
+		t.Fatal("confirm page must count as busy (done-detector guard)")
+	}
+	if isQuestionConfirmPage(questionDialogFrame("q?", "a", "b")) {
+		t.Fatal("question page must not be misread as confirm page")
+	}
+	if isQuestionConfirmPage(multiQuestionFrame(" A   B   Confirm", "q?", "a", "b")) {
+		t.Fatal("multi-question question page must not be misread as confirm")
+	}
+}
+
+// respondQuestionPage via RespondPermission: a matching option label is
+// injected as its NUMBER (digit keys select AND auto-confirm — probed
+// 2026-09-05); unmatched text goes through the free-text entry (digit
+// opens the input, paste, Enter); a stale fingerprint injects nothing.
+func TestRespondQuestionDigit(t *testing.T) {
+	s, r := newDriverForTest(t)
+	frame := questionDialogFrame("coffee or tea?", "coffee", "tea")
+	r.mu.Lock()
+	r.captures = []string{frame}
+	r.mu.Unlock()
+	block, _ := extractQuestionDialog(frame)
+	fp := questionFingerprint(block)
+
+	err := s.RespondPermission(fp, core.PermissionResult{
+		Behavior:     "allow",
+		UpdatedInput: map[string]any{"answers": map[string]any{"coffee or tea?": "tea"}},
+	})
+	if err != nil {
+		t.Fatalf("RespondPermission: %v", err)
+	}
+	if got := r.SentTexts(); !reflect.DeepEqual(got, []string{"2"}) {
+		t.Fatalf("sentTexts = %v, want digit 2 only", got)
+	}
+}
+
+func TestRespondQuestionFreeText(t *testing.T) {
+	oldDelay := questionInputOpenDelay
+	questionInputOpenDelay = time.Millisecond
+	t.Cleanup(func() { questionInputOpenDelay = oldDelay })
+
+	s, r := newDriverForTest(t)
+	frame := questionDialogFrame("coffee or tea?", "coffee", "tea")
+	r.mu.Lock()
+	r.captures = []string{frame}
+	r.mu.Unlock()
+	block, _ := extractQuestionDialog(frame)
+	fp := questionFingerprint(block)
+
+	err := s.RespondPermission(fp, core.PermissionResult{
+		Behavior:     "allow",
+		UpdatedInput: map[string]any{"answers": map[string]any{"coffee or tea?": "加两块糖，谢谢"}},
+	})
+	if err != nil {
+		t.Fatalf("RespondPermission: %v", err)
+	}
+	if got := r.SentTexts(); !reflect.DeepEqual(got, []string{"3"}) {
+		t.Fatalf("sentTexts = %v, want the free-text entry digit 3", got)
+	}
+	if got := r.lastInjected(); got != "加两块糖，谢谢" {
+		t.Fatalf("injected = %q, want the pasted answer", got)
+	}
+	if !r.containsKey("Enter") {
+		t.Fatal("free-text path must submit with Enter")
+	}
+}
+
+func TestRespondQuestionStale(t *testing.T) {
+	s, r := newDriverForTest(t)
+	frame := questionDialogFrame("coffee or tea?", "coffee", "tea")
+	r.mu.Lock()
+	r.captures = []string{frame}
+	r.mu.Unlock()
+
+	if err := s.RespondPermission("deadbeef", core.PermissionResult{
+		Behavior:     "allow",
+		UpdatedInput: map[string]any{"answers": map[string]any{"q": "tea"}},
+	}); err != nil {
+		t.Fatalf("stale RespondPermission must be a no-op, got %v", err)
+	}
+	if len(r.SentTexts()) != 0 || r.containsKey("Enter") {
+		t.Fatal("stale fingerprint must inject nothing")
+	}
+}
+
+// A multi-question dialog: question page emits the AskUserQuestion card;
+// after the (host-side or IM) answer the dialog lands on the Confirm page,
+// which pollTurn submits automatically — the turn then completes normally.
+func TestConfirmPageAutoSubmit(t *testing.T) {
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_mq", Directory: "/ws/foo", Updated: 9000}})
+	e := ocExport{}
+	e.Messages = append(e.Messages, ocMsg("user", "hi"), ocMsg("assistant", "done"))
+	r.exports["ses_mq"] = marshalExport(t, e)
+	qframe := multiQuestionFrame(" Beverage   Sugar   Confirm", "coffee or tea?", "coffee", "tea")
+	r.captures = []string{
+		"idle ctrl+p",
+		"working esc interrupt",
+		qframe,
+		qframe,
+		confirmPageFrame(),
+		confirmPageFrame(),
+		"idle ctrl+p",
+		"idle ctrl+p",
+	}
+	r.mu.Unlock()
+
+	if err := s.Send("hi", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	var reqs int
+	var texts []string
+	deadline := time.After(3 * time.Second)
+	done := false
+	for !done {
+		select {
+		case ev := <-s.Events():
+			switch ev.Type {
+			case core.EventPermissionRequest:
+				reqs++
+			case core.EventText:
+				texts = append(texts, ev.Content)
+			case core.EventResult:
+				done = ev.Done
+			}
+		case <-deadline:
+			t.Fatal("no result event within timeout")
+		}
+	}
+	if reqs != 1 {
+		t.Fatalf("question page must emit exactly 1 request, got %d", reqs)
+	}
+	if !r.containsKey("Enter") {
+		t.Fatal("confirm page must be auto-submitted with Enter")
+	}
+	if !strings.Contains(strings.Join(texts, ""), "done") {
+		t.Fatalf("texts = %q, want the reply after confirm submit", texts)
 	}
 }
 

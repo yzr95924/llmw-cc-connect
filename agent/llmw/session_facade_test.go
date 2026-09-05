@@ -216,6 +216,25 @@ func (r *fakePaneRunner) sentKeysLen() int {
 	return len(r.sentKeys)
 }
 
+// SentTexts returns the recorded literal send-keys texts (dialog digits).
+func (r *fakePaneRunner) SentTexts() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.sentTexts...)
+}
+
+// containsKey reports whether a named key was sent at least once.
+func (r *fakePaneRunner) containsKey(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, k := range r.sentKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
 // scriptTurn arms one full turn: busy captures, then idle; plus a matching
 // session-list/export pair so the driver discovers and returns the reply.
 func (r *fakePaneRunner) scriptTurn(prompt, reply string) {

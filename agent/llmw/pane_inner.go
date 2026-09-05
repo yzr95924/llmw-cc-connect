@@ -24,11 +24,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,11 +63,15 @@ const (
 	// signal that the TUI swallowed a prompt-box command and is back at
 	// rest. Also the primary health anchor for SelfCheck.
 	paneIdleHint = "ctrl+p commands"
-	// questionDialogSpan is how many lines above the question-dialog footer
-	// belong to the dialog block (question text + options). Generous on
-	// purpose: dialogs with many options or multi-question tabs are taller,
-	// and lines above the dialog are frozen while the modal is up (stable
-	// for fingerprinting).
+	// questionChromeSpan bounds the walk-up from the question-dialog footer
+	// to the first option row: at most a workdir/branch status row and a
+	// blank sit between them (probed 2026-09-05). The dialog block itself
+	// is bounded structurally (blank lines), not by a span — see
+	// extractQuestionDialog.
+	questionChromeSpan = 3
+	// questionDialogSpan is the LEGACY fallback span for footer-matched
+	// dialogs without parseable option rows (detection still matters for
+	// paneBusy and the L1 notice; parsing fails on these by design).
 	questionDialogSpan = 20
 	paneTurnTimeout    = 10 * time.Minute
 	// paneDiscoverTries is how many newest same-directory sessions to check
@@ -87,6 +93,13 @@ var (
 	// for seconds after that (the live smoke gate budgets 20s for the same
 	// boot). Var so tests can shrink it.
 	paneBootTimeout = 20 * time.Second
+
+	// questionInputOpenDelay paces the free-text dialog path: after the
+	// free-text entry's digit opens the inline input (and after the paste)
+	// the TUI needs a beat before it consumes the next key (probed
+	// 2026-09-05 with ~1s manual pacing; 600ms held). Var so tests can
+	// shrink it.
+	questionInputOpenDelay = 600 * time.Millisecond
 )
 
 // paneRunner abstracts the external commands the driver needs (real: tmux on
@@ -332,7 +345,20 @@ type paneSession struct {
 	sesID  string // sticky opencode session id ("" until first turn)
 	cursor int    // messages consumed from the export so far
 	permFP string // fingerprint of the permission dialog already reported ("" = none)
-	qFP    string // fingerprint of the question dialog already notified ("" = none)
+	qFP    string // fingerprint of the question dialog already reported ("" = none)
+	// qAnswered marks that qFP's dialog was answered FROM IM: the TUI
+	// dismiss animation lingers ~2s and would otherwise re-emit the same
+	// card (fp dedup holds only while qFP stays set) and, once the dialog
+	// is really gone, false-warn an orphan.
+	qAnswered bool
+
+	// injectMu serializes every MULTI-STEP key-injection sequence against
+	// the pane (Send's inject+submit, Abort's ESC, the permission/question
+	// dialog responses, the live mode/model switches). Telegram's poll
+	// loop already serializes platform traffic, but a second platform
+	// (or a callback racing a message) could interleave two sequences and
+	// corrupt the dialog state machine. Leaf lock: never takes s.mu.
+	injectMu sync.Mutex
 }
 
 func newPaneSession(ctx context.Context, runner paneRunner, workDir string) *paneSession {
@@ -373,12 +399,15 @@ func (s *paneSession) Send(prompt string, _ string, _ []core.ImageAttachment, _ 
 		s.emit(core.Event{Type: core.EventResult, Done: true})
 		return nil
 	}
-	if err := s.runner.inject(prompt); err != nil {
-		return err
+	s.injectMu.Lock()
+	err := s.runner.inject(prompt)
+	if err == nil {
+		// Let the TUI register the bracketed paste before submitting.
+		time.Sleep(paneSettleDelay)
+		err = s.runner.submit()
 	}
-	// Let the TUI register the bracketed paste before submitting.
-	time.Sleep(paneSettleDelay)
-	if err := s.runner.submit(); err != nil {
+	s.injectMu.Unlock()
+	if err != nil {
 		return err
 	}
 	if prompt == newCmd {
@@ -415,6 +444,7 @@ func (s *paneSession) pollTurn(promptEcho string, pollInterval, streamInterval t
 	prev := ""
 	stable := 0
 	seenBusy := false
+	confirmSubmitted := false // multi-question Confirm page: Enter sent once
 	st := &turnStream{tools: map[string]bool{}}
 	// complete ends the turn with an optional final text (the one place that
 	// emits EventResult — the engine only releases the session on it).
@@ -467,16 +497,60 @@ func (s *paneSession) pollTurn(promptEcho string, pollInterval, streamInterval t
 			} else {
 				s.setPermFP("") // dialog gone (answered on the host side)
 			}
-			// Question dialog (question tool): L1 handling — hold the turn busy
-			// (paneBusy union) and notify IM once per dialog; the answer itself
-			// is given on the host window (L2 would answer from IM).
+			// Question dialog (question tool): L2 handling — parse the page
+			// and emit it as an AskUserQuestion permission request, so the
+			// engine renders IM BUTTONS (its pending-permission path
+			// bypasses the session lock; plain mid-turn messages would be
+			// queued and never reach us). The user's answer comes back
+			// through RespondPermission; multi-question dialogs advance
+			// tab by tab (each page re-emits) and the final Confirm page
+			// is auto-submitted below. Parse failure degrades to the old
+			// L1 host-window notice.
 			if qblock, ok := extractQuestionDialog(cur); ok {
 				if fp := questionFingerprint(qblock); fp != s.currentQFP() {
 					s.setQFP(fp)
-					s.emit(core.Event{Type: core.EventText, Content: "❓ opencode 正在等待选择（问题：" + questionPreview(qblock) + "）——请到主机窗口操作，完成后回合自动继续"})
+					if q, _, _, pok := parseQuestionPage(qblock); pok {
+						s.emit(core.Event{
+							Type:      core.EventPermissionRequest,
+							RequestID: fp,
+							ToolName:  "AskUserQuestion",
+							Questions: []core.UserQuestion{q},
+						})
+					} else {
+						s.emit(core.Event{Type: core.EventText, Content: "❓ opencode 正在等待选择（问题：" + questionPreview(qblock) + "）——弹窗解析失败，请到主机窗口操作，完成后回合自动继续"})
+					}
 				}
 			} else {
-				s.setQFP("") // dialog gone (answered/dismissed on the host side)
+				if fp, answered := s.qState(); fp != "" && !answered {
+					// The dialog vanished WITHOUT an IM answer (answered or
+					// dismissed on the host). The engine's pending card, if
+					// one went out, stays unresolved and BLOCKS its turn
+					// loop until the next IM message is consumed as the
+					// answer (engine resolves pending on any message —
+					// handlePendingPermission). Nothing the agent can emit
+					// reaches it, so log the wedge shape for diagnosis; the
+					// 2026-09-05 incident surfaced exactly this state.
+					slog.Warn(agentName+": question dialog gone without IM answer (host-side action?) — an orphaned IM card, if any, resolves on the next message", "fingerprint", fp)
+				}
+				s.clearQDialog() // dialog gone (answered/dismissed on the host side)
+			}
+			// Multi-question Confirm page (probed 2026-09-05): after the
+			// last question is answered the dialog lands on a Review page
+			// whose footer has no "select" (see paneBusy union). Every
+			// answer was already explicitly chosen per question — submit
+			// automatically instead of leaving the turn hanging. The flag
+			// arms only on success, so a failed submit retries next tick
+			// instead of wedging the turn to the 10-minute timeout; the
+			// key rides injectMu like every other injection.
+			if isQuestionConfirmPage(cur) && !confirmSubmitted {
+				s.injectMu.Lock()
+				err := s.sendPaneKeys("Enter")
+				s.injectMu.Unlock()
+				if err != nil {
+					slog.Warn("llmw pane: confirm page submit failed, will retry", "err", err)
+				} else {
+					confirmSubmitted = true
+				}
 			}
 			if cur == prev {
 				stable++
@@ -834,6 +908,8 @@ func (s *paneSession) SetLiveMode(mode string) bool {
 	if !s.alive.Load() || s.turnActive.Load() {
 		return false
 	}
+	s.injectMu.Lock()
+	defer s.injectMu.Unlock()
 	// build ↔ plan needs one Tab; extra presses cover user-defined subagents
 	// cycling through the same key.
 	for i := 0; i < 4; i++ {
@@ -1010,6 +1086,8 @@ func (s *paneSession) SetLiveModel(target string) error {
 	if s.turnActive.Load() {
 		return fmt.Errorf("pane: 回合进行中，暂不能切换模型（请稍后再试）")
 	}
+	s.injectMu.Lock()
+	defer s.injectMu.Unlock()
 	provider, name := splitModelID(target)
 	if name == "" {
 		return fmt.Errorf("pane: 无效模型 %q", target)
@@ -1161,6 +1239,15 @@ func (s *paneSession) discoverSession(promptEcho string) (string, error) {
 // once" is preselected, Tab does nothing). If the dialog is already gone
 // (answered on the host in the meantime), this is a no-op — sending keys to
 // an idle pane would type into the prompt box.
+//
+// It also carries back AskUserQuestion answers (engine sends
+// UpdatedInput.answers): the option whose label matches is picked with its
+// NUMBER key (a digit selects AND auto-confirms — probed 2026-09-05);
+// non-matching text goes through the numbered free-text entry (digit opens
+// the input, bracketed paste, Enter submits). Key contract 2026-09-05:
+// initial cursor = option 1; multi-question dialogs advance tabs
+// automatically after each answer; the final Confirm page is auto-entered
+// by pollTurn.
 func (s *paneSession) RespondPermission(requestID string, result core.PermissionResult) error {
 	if !s.alive.Load() {
 		return fmt.Errorf("pane: session closed")
@@ -1169,17 +1256,26 @@ func (s *paneSession) RespondPermission(requestID string, result core.Permission
 	if err != nil {
 		return fmt.Errorf("pane: capture for permission response: %w", err)
 	}
-	block, ok := extractPermDialog(cur)
-	if !ok || permFingerprint(block) != requestID {
-		s.setPermFP("") // stale request; nothing to answer
-		return nil
+	if block, ok := extractPermDialog(cur); ok && permFingerprint(block) == requestID {
+		s.injectMu.Lock()
+		defer s.injectMu.Unlock()
+		return s.respondPermDialog(requestID, block, result)
 	}
-	// Key sequences (probed 2026-08-30): "Allow once" is preselected; Right
-	// moves once for "Allow always", twice for "Reject". "Allow always"
-	// opens a SECOND page (Always allow / Confirm / Cancel, Confirm
-	// preselected) — a paced Enter confirms it. Without a second page
-	// (older builds) the trailing Enter lands on the empty prompt box and
-	// is a no-op.
+	// Question page: fingerprint match then digit/paste injection.
+	if qblock, ok := extractQuestionDialog(cur); ok && questionFingerprint(qblock) == requestID {
+		s.injectMu.Lock()
+		defer s.injectMu.Unlock()
+		return s.respondQuestionPage(qblock, result)
+	}
+	s.setPermFP("")  // stale request; nothing to answer
+	s.clearQDialog() // stale question markers too
+	return nil
+}
+
+// respondPermDialog drives the permission dialog keys (Left/Right + Enter;
+// "Allow always" opens a preselected second page confirmed by a paced
+// Enter). Probed 2026-08-30.
+func (s *paneSession) respondPermDialog(requestID string, block string, result core.PermissionResult) error {
 	var keys []string
 	switch result.Behavior {
 	case "allow_all":
@@ -1201,6 +1297,67 @@ func (s *paneSession) RespondPermission(requestID string, result core.Permission
 		}
 	}
 	s.setPermFP("") // an identical re-appearing dialog (agent retry) re-emits
+	return nil
+}
+
+// respondQuestionPage injects an AskUserQuestion answer into the live
+// question dialog. The engine's UpdatedInput.answers carries exactly one
+// entry per request (one question per page).
+func (s *paneSession) respondQuestionPage(qblock string, result core.PermissionResult) error {
+	answer := ""
+	if m, ok := result.UpdatedInput["answers"].(map[string]any); ok {
+		for _, v := range m {
+			if str, ok := v.(string); ok {
+				answer = str
+			}
+		}
+	}
+	q, nums, freeIdx, ok := parseQuestionPage(qblock)
+	if !ok {
+		return fmt.Errorf("pane: question page no longer parseable")
+	}
+	answer = sanitizeDialogAnswer(answer)
+	if answer == "" {
+		return fmt.Errorf("pane: 空的回答被拒绝（请点按钮或回复数字/文本）")
+	}
+	slog.Info(agentName+": answering question dialog", "question", q.Question, "answer", answer)
+	// Digit keys only exist for 1-9: a two-digit sendText("10") would type
+	// "1" FIRST, which selects option 1 AND auto-confirms — a silently
+	// wrong answer. Degrade explicitly instead of injecting garbage.
+	digitKey := func(n int) error {
+		if n < 1 || n > 9 {
+			return fmt.Errorf("pane: 选项序号 %d 超出数字键范围（1-9），请到主机窗口操作", n)
+		}
+		return s.runner.sendText(strconv.Itoa(n))
+	}
+	for i, opt := range q.Options {
+		if strings.EqualFold(opt.Label, answer) {
+			// A digit key selects the option AND auto-confirms; on the last
+			// question it also advances to the Confirm page.
+			if err := digitKey(nums[i]); err != nil {
+				return err
+			}
+			s.markQAnswered() // keep qFP: the dismiss animation lingers ~2s
+			return nil
+		}
+	}
+	if freeIdx == 0 {
+		return fmt.Errorf("pane: 回答不是任何选项且弹窗没有自由文本入口")
+	}
+	// Free-text path (probed 2026-09-05): the entry's number opens an
+	// inline input; bracketed paste lands in it; Enter submits.
+	if err := digitKey(freeIdx); err != nil {
+		return err
+	}
+	time.Sleep(questionInputOpenDelay)
+	if err := s.runner.inject(answer); err != nil { // bracketed paste
+		return err
+	}
+	time.Sleep(questionInputOpenDelay)
+	if err := s.runner.sendKey("Enter"); err != nil {
+		return err
+	}
+	s.markQAnswered() // keep qFP: the dismiss animation lingers ~2s
 	return nil
 }
 
@@ -1233,6 +1390,8 @@ func (s *paneSession) Abort() error {
 	if !paneBusy(cap) {
 		return fmt.Errorf("pane: 当前没有进行中的回合")
 	}
+	s.injectMu.Lock()
+	defer s.injectMu.Unlock()
 	if err := s.runner.sendKey("Escape"); err != nil {
 		return fmt.Errorf("pane: send Escape: %w", err)
 	}
@@ -1243,8 +1402,9 @@ func (s *paneSession) Abort() error {
 
 // paneBusy reports whether the pane is mid-turn: the interrupt hint is
 // shown, a permission dialog (first page OR the "Always allow" confirm
-// page) is waiting for an answer, or a question dialog is waiting for a
-// selection (all of them hide the hint while they are up).
+// page) is waiting for an answer, a question page is waiting for a
+// selection, or the multi-question Confirm page is up (all of them hide
+// the hint while they are up).
 func paneBusy(cap string) bool {
 	if strings.Contains(cap, paneBusyMarker) {
 		return true
@@ -1255,8 +1415,10 @@ func paneBusy(cap string) bool {
 	if _, ok := extractPermDialog(cap); ok {
 		return true
 	}
-	_, ok := extractQuestionDialog(cap)
-	return ok
+	if _, ok := extractQuestionDialog(cap); ok {
+		return true
+	}
+	return isQuestionConfirmPage(cap)
 }
 
 func (s *paneSession) currentPermFP() string {
@@ -1277,9 +1439,38 @@ func (s *paneSession) currentQFP() string {
 	return s.qFP
 }
 
+// qState returns the question-dialog fingerprint and whether the current
+// dialog was already answered from IM.
+func (s *paneSession) qState() (fp string, answered bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.qFP, s.qAnswered
+}
+
+// setQFP records the emitted dialog's fingerprint and resets the answered
+// marker (a fresh dialog page is being announced).
 func (s *paneSession) setQFP(fp string) {
 	s.mu.Lock()
 	s.qFP = fp
+	s.qAnswered = false
+	s.mu.Unlock()
+}
+
+// markQAnswered keeps the fingerprint (suppressing re-emit while the
+// dismissed dialog lingers on screen ~2s, 2026-09-05 production trace)
+// and marks the dialog IM-answered, so the dialog-gone branch does not
+// false-warn an orphan.
+func (s *paneSession) markQAnswered() {
+	s.mu.Lock()
+	s.qAnswered = true
+	s.mu.Unlock()
+}
+
+// clearQDialog drops both markers (dialog gone or stale request).
+func (s *paneSession) clearQDialog() {
+	s.mu.Lock()
+	s.qFP = ""
+	s.qAnswered = false
 	s.mu.Unlock()
 }
 
@@ -1291,12 +1482,34 @@ func (s *paneSession) setQFP(fp string) {
 // is the anchor — the permission dialog footer says "enter confirm / esc
 // reject", so the two cannot be confused. The block spans a fixed window of
 // lines above the footer (question + options) and is hashed for dedup.
+// extractQuestionDialog pulls the question-tool dialog out of a capture as
+// a TIGHT, structurally bounded block (2026-09-05 redesign). The first
+// version grabbed a fixed 20-line window above the footer — in a busy pane
+// the dialog itself is only ~10 lines and everything above is streaming
+// conversation text, whose numbered-list lines ("2. Stable fingerprint →
+// injection works") parsed as dialog options and whose chrome rows
+// ("master" git-branch status) surfaced as the question (both shapes seen
+// in the 2026-09-05 production incident). The dialog's real structure is:
+//
+//	[blank] question [blank] N. option (desc) ... free-text entry [chrome] footer
+//
+// so the block is bounded by walking up from the footer: skip chrome rows
+// (workdir/branch status, ≤3), collect the contiguous option region
+// (option rows plus description rows that sit directly below an option),
+// stop at the blank line above it, skip one blank, and take the contiguous
+// question run up to the next blank. Conversation junk above the dialog is
+// separated by that blank and never enters the block.
 func extractQuestionDialog(cap string) (string, bool) {
 	lines := strings.Split(cap, "\n")
 	foot := -1
 	for i := len(lines) - 1; i >= 0; i-- {
 		l := lines[i]
-		if strings.Contains(l, "select") && strings.Contains(l, "enter submit") && strings.Contains(l, "esc dismiss") {
+		// Single-question footers say "enter submit"; multi-question
+		// QUESTION pages say "enter confirm" (their final Confirm page
+		// says "enter submit" again but has NO "select" — probed
+		// 2026-09-05). "select" is what keeps the Confirm page out.
+		hasEnter := strings.Contains(l, "enter submit") || strings.Contains(l, "enter confirm")
+		if strings.Contains(l, "select") && hasEnter && strings.Contains(l, "esc dismiss") {
 			foot = i
 			break
 		}
@@ -1304,28 +1517,239 @@ func extractQuestionDialog(cap string) (string, bool) {
 	if foot < 0 {
 		return "", false
 	}
-	start := foot - questionDialogSpan
-	if start < 0 {
-		start = 0
+	trimGutter := func(s string) string {
+		return strings.TrimLeft(strings.TrimSpace(s), " ┃│>❯")
 	}
-	return strings.TrimSpace(strings.Join(lines[start:foot+1], "\n")), true
+	isOpt := func(s string) bool {
+		return paneNumberedOptionRe.MatchString(s)
+	}
+	// Walk up from the footer (skipping chrome rows) to the LAST option
+	// row — the numbered free-text entry or the lowest real option.
+	lastOpt := -1
+	for j := foot - 1; j >= 0 && j >= foot-questionChromeSpan; j-- {
+		l := trimGutter(lines[j])
+		if l == "" {
+			continue
+		}
+		if isOpt(l) {
+			lastOpt = j
+			break
+		}
+	}
+	if lastOpt < 0 {
+		// No option rows in reach: still a dialog footer (paneBusy and the
+		// L1 fallback rely on detection) — return the legacy span block;
+		// parseQuestionPage will fail on it and degrade to the L1 notice.
+		start := foot - questionDialogSpan
+		if start < 0 {
+			start = 0
+		}
+		return strings.TrimSpace(strings.Join(lines[start:foot+1], "\n")), true
+	}
+	// Option region: contiguous option rows upward; a non-option row is a
+	// description when the row BELOW it is an option row; anything else
+	// ends the region.
+	top := lastOpt
+	for k := lastOpt; k >= 0; k-- {
+		l := trimGutter(lines[k])
+		if l == "" {
+			break
+		}
+		if isOpt(l) {
+			top = k
+			continue
+		}
+		if k+1 <= lastOpt && isOpt(trimGutter(lines[k+1])) {
+			continue // description row (sits directly below its option)
+		}
+		break
+	}
+	// Question run: skip one blank above the options, then take the
+	// contiguous non-blank lines (the question may wrap) until a blank.
+	// qEnd is the block START (above the options); degenerate only when no
+	// content exists above the option region.
+	q := top - 1
+	for q >= 0 && trimGutter(lines[q]) == "" {
+		q--
+	}
+	qEnd := q
+	for q >= 0 && trimGutter(lines[q]) != "" {
+		qEnd = q
+		q--
+	}
+	if qEnd < 0 {
+		qEnd = top // no question text; block = options only
+	}
+	return strings.TrimSpace(strings.Join(lines[qEnd:foot+1], "\n")), true
 }
 
 // questionFingerprint derives the dedup id from the dialog block.
+// questionFingerprint derives a STABLE dedup id for the dialog: it hashes
+// the parsed question text and option labels, NOT the raw block. The raw
+// 20-line block window carries volatile rows (streaming text, spinners,
+// token counters) whose every-tick drift made raw-block fingerprints
+// unstable — the 2026-09-05 production incident: the same dialog re-emitted
+// duplicate cards on every drift tick, and card answers arrived as "stale"
+// no-ops because the fingerprint had already moved (fix: hash only what
+// cannot change while the dialog is up). Unparseable dialogs (L1 fallback)
+// hash the footer line + preview text.
 func questionFingerprint(block string) string {
-	sum := sha256.Sum256([]byte(block))
-	return hex.EncodeToString(sum[:])[:16]
+	h := sha256.New()
+	if q, _, _, ok := parseQuestionPage(block); ok {
+		io.WriteString(h, q.Question)
+		for _, opt := range q.Options {
+			io.WriteString(h, "\x00"+opt.Label)
+		}
+	} else {
+		io.WriteString(h, "raw:\x00"+questionPreview(block)+"\x00")
+		for _, l := range strings.Split(block, "\n") {
+			if strings.Contains(l, "esc dismiss") {
+				io.WriteString(h, l)
+			}
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // paneNumberedOptionRe matches the dialog's option rows ("1. coffee").
 var paneNumberedOptionRe = regexp.MustCompile(`^\d+\. `)
 
-// questionPreview extracts a one-line preview of the question text for the
-// IM notification: scanning upward from the footer, the first line that is
-// not empty, not a numbered option, not the custom-answer entry, and not the
-// workdir status row (which carries a path).
+// paneNumberedOptionLabelRe captures the option number and label.
+var paneNumberedOptionLabelRe = regexp.MustCompile(`^(\d+)\.\s+(.*)$`)
+
+// isQuestionConfirmPage reports whether the capture shows the
+// multi-question dialog's final Confirm page: its footer carries
+// "⇆ tab ... enter submit ... esc dismiss" but NO "select" — the question
+// pages' footers always have "select". Probed 2026-09-05 (opencode
+// 1.18.28).
+func isQuestionConfirmPage(cap string) bool {
+	for _, l := range strings.Split(cap, "\n") {
+		t := strings.TrimSpace(l)
+		if strings.Contains(t, "⇆ tab") && strings.Contains(t, "enter submit") &&
+			strings.Contains(t, "esc dismiss") && !strings.Contains(t, "select") {
+			return true
+		}
+	}
+	return false
+}
+
+// parseQuestionPage parses one page of the question dialog into an engine
+// UserQuestion plus the TUI option numbers. Layout probed 2026-09-05
+// against opencode 1.18.28: option rows are "N. label" with optional
+// indented description rows below; the free-text entry ("Type your own
+// answer") is itself numbered; multi-question pages carry a leading tab
+// strip (" A   B   Confirm") above the question text, which the
+// question-text scan never reaches (it stops at the question line before
+// the strip). Returns the question (free-text entry excluded from
+// Options), nums aligned with Options (the TUI digit of each option),
+// the free-text entry's digit (0 = absent), and whether a question page
+// was recognized.
+func parseQuestionPage(block string) (q core.UserQuestion, nums []int, freeIdx int, ok bool) {
+	lines := strings.Split(block, "\n")
+	type optRow struct {
+		n, line int
+		label   string
+	}
+	var rows []optRow
+	for i, raw := range lines {
+		l := strings.TrimLeft(strings.TrimSpace(raw), " ┃│>❯")
+		m := paneNumberedOptionLabelRe.FindStringSubmatch(l)
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		rows = append(rows, optRow{n, i, strings.TrimSpace(m[2])})
+	}
+	if len(rows) == 0 {
+		return q, nil, 0, false
+	}
+	for _, r := range rows {
+		if strings.Contains(r.label, "Type your own answer") {
+			freeIdx = r.n
+			continue // UI affordance, not a real choice — free text reaches it
+		}
+		opt := core.UserQuestionOption{Label: r.label}
+		// Indented description row directly below the option (the free-text
+		// entry gains one only AFTER the user opens its input).
+		if r.line+1 < len(lines) {
+			d := strings.TrimLeft(strings.TrimSpace(lines[r.line+1]), " ┃│>❯")
+			if d != "" && !paneNumberedOptionRe.MatchString(d) &&
+				!strings.Contains(d, "esc dismiss") && !strings.Contains(d, "⇆ tab") {
+				opt.Description = d
+			}
+		}
+		q.Options = append(q.Options, opt)
+		nums = append(nums, r.n)
+	}
+	if len(q.Options) == 0 {
+		return q, nil, 0, false
+	}
+	// Contract guard (2026-09-05): every real question dialog carries the
+	// numbered "Type your own answer" entry — probed on single- and
+	// multi-question forms. A parsed "dialog" WITHOUT it is conversation
+	// junk (numbered-list text) leaking through the legacy span fallback;
+	// reject so the caller degrades to the L1 notice instead of emitting
+	// a garbage card.
+	if freeIdx == 0 {
+		return q, nil, 0, false
+	}
+	q.Question = questionPreview(block)
+	return q, nums, freeIdx, true
+}
+
+// sanitizeDialogAnswer flattens an IM free-text answer for the dialog's
+// single-line input: newlines would submit early.
+func sanitizeDialogAnswer(ans string) string {
+	ans = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(ans)
+	ans = strings.TrimSpace(ans)
+	if runes := []rune(ans); len(runes) > 2000 {
+		ans = string(runes[:2000])
+	}
+	return ans
+}
+
+// questionPreview extracts the question text. It is STRUCTURAL first
+// (2026-09-05): the question sits directly above the first "N. " option
+// row, separated by a blank — take the WHOLE contiguous run (questions
+// wrap) up to the next blank. Keyword heuristics misfired in real wide
+// windows (a bare "master" git-branch row inside the block was returned
+// as the question); the old upward keyword scan stays as the fallback for
+// layouts without option rows.
 func questionPreview(block string) string {
 	lines := strings.Split(block, "\n")
+	firstOpt := -1
+	for i, raw := range lines {
+		l := strings.TrimLeft(strings.TrimSpace(raw), " ┃│>❯")
+		if paneNumberedOptionRe.MatchString(l) {
+			firstOpt = i
+			break
+		}
+	}
+	if firstOpt >= 0 {
+		j := firstOpt - 1
+		for j >= 0 && strings.TrimLeft(strings.TrimSpace(lines[j]), " ┃│>❯") == "" {
+			j--
+		}
+		var run []string
+		for ; j >= 0; j-- {
+			l := strings.TrimLeft(strings.TrimSpace(lines[j]), " ┃│>❯")
+			if l == "" || strings.Contains(l, "esc dismiss") || strings.Contains(l, "⇆ tab") {
+				break
+			}
+			run = append([]string{l}, run...) // prepend: walking upward
+		}
+		if len(run) > 0 {
+			out := strings.Join(run, " ")
+			if runes := []rune(out); len(runes) > 80 {
+				return string(runes[:80]) + "…"
+			}
+			return out
+		}
+	}
+	// Fallback: scan up from the footer, skipping known non-question rows.
 	for i := len(lines) - 1; i >= 0; i-- {
 		// Strip the TUI gutter prefix ("  ┃  1. coffee" → "1. coffee").
 		l := strings.TrimLeft(strings.TrimSpace(lines[i]), " ┃│>❯")
