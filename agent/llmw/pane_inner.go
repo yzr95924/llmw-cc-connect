@@ -69,6 +69,19 @@ const (
 	// is bounded structurally (blank lines), not by a span — see
 	// extractQuestionDialog.
 	questionChromeSpan = 3
+	// Bottom-anchored UI zones (probed 2026-09-06 against a 1.18.29
+	// sandbox and the 1.18.28 production pane): the TUI draws live chrome
+	// — dialogs, input box, status bar — at the pane bottom, while the
+	// scrolling transcript above renders the agent's OWN tool output,
+	// which can quote any anchor text verbatim (2026-09-06 wedges:
+	// echoed busy/perm-confirm text kept paneBusy true forever after a
+	// compact, IM stuck on the busy reply; README anchor quotes forged
+	// dialogs). Every anchor match is zone-scoped from the pane bottom,
+	// never full-pane.
+	paneBusyZone   = 2  // spinner+interrupt row is the bottom-most non-empty row (both versions)
+	paneChromeZone = 9  // idle chrome stack: border, key hints, tip, gutters, model bar, workdir
+	paneDialogZone = 30 // dialog block extent: probed ~12 rows; 30 keeps tall dialogs (6+ options / wrapped questions) whole while the foot zone stays the hard gate
+	paneFootZone   = 5  // dialog footer/options rows: probed 2nd from bottom on every dialog
 	// questionDialogSpan is the LEGACY fallback span for footer-matched
 	// dialogs without parseable option rows (detection still matters for
 	// paneBusy and the L1 notice; parsing fails on these by design).
@@ -100,6 +113,10 @@ var (
 	// 2026-09-05 with ~1s manual pacing; 600ms held). Var so tests can
 	// shrink it.
 	questionInputOpenDelay = 600 * time.Millisecond
+
+	// questionFallbackMinInterval rate-limits the L1 host-window notice for
+	// unparseable footer-matched frames (var for test overrides).
+	questionFallbackMinInterval = 60 * time.Second
 )
 
 // paneRunner abstracts the external commands the driver needs (real: tmux on
@@ -351,6 +368,14 @@ type paneSession struct {
 	// card (fp dedup holds only while qFP stays set) and, once the dialog
 	// is really gone, false-warn an orphan.
 	qAnswered bool
+	// qCard records that the current dialog page was emitted as a real
+	// AskUserQuestion card (vs a rate-limited L1 fallback notice). Only
+	// card-carrying appearances can orphan a pending on disappearance.
+	qCard bool
+	// qLastFallback rate-limits L1 fallback notices. Global on purpose:
+	// a flickering anchor (streaming text scrolling the footer tokens in
+	// and out of view) defeats any per-appearance reset.
+	qLastFallback time.Time
 
 	// injectMu serializes every MULTI-STEP key-injection sequence against
 	// the pane (Send's inject+submit, Abort's ESC, the permission/question
@@ -445,6 +470,7 @@ func (s *paneSession) pollTurn(promptEcho string, pollInterval, streamInterval t
 	stable := 0
 	seenBusy := false
 	confirmSubmitted := false // multi-question Confirm page: Enter sent once
+	permMiss, qMiss := 0, 0   // consecutive extraction misses (torn-frame debounce)
 	st := &turnStream{tools: map[string]bool{}}
 	// complete ends the turn with an optional final text (the one place that
 	// emits EventResult — the engine only releases the session on it).
@@ -484,6 +510,7 @@ func (s *paneSession) pollTurn(promptEcho string, pollInterval, streamInterval t
 			// per distinct dialog; the engine renders IM buttons and the
 			// user's choice comes back through RespondPermission.
 			if block, ok := extractPermDialog(cur); ok {
+				permMiss = 0
 				if fp := permFingerprint(block); fp != s.currentPermFP() {
 					s.setPermFP(fp)
 					tool, input := parsePermDialog(block)
@@ -494,6 +521,10 @@ func (s *paneSession) pollTurn(promptEcho string, pollInterval, streamInterval t
 						ToolInput: input,
 					})
 				}
+			} else if permMiss++; permMiss < 2 {
+				// A single torn frame (mid-redraw blank) must not clear the
+				// fingerprint — the next tick would re-detect the same dialog
+				// and re-emit its card (paneStableNeeded idea, 2026-09-06).
 			} else {
 				s.setPermFP("") // dialog gone (answered on the host side)
 			}
@@ -507,29 +538,41 @@ func (s *paneSession) pollTurn(promptEcho string, pollInterval, streamInterval t
 			// is auto-submitted below. Parse failure degrades to the old
 			// L1 host-window notice.
 			if qblock, ok := extractQuestionDialog(cur); ok {
+				qMiss = 0
 				if fp := questionFingerprint(qblock); fp != s.currentQFP() {
-					s.setQFP(fp)
 					if q, _, _, pok := parseQuestionPage(qblock); pok {
+						s.setQFP(fp) // new page: reset answered/card markers
+						s.markQCard()
 						s.emit(core.Event{
 							Type:      core.EventPermissionRequest,
 							RequestID: fp,
 							ToolName:  "AskUserQuestion",
 							Questions: []core.UserQuestion{q},
 						})
-					} else {
+					} else if s.allowFallbackNotice() {
+						// Unparseable footer-matched frame: at most ONE L1
+						// host-window notice per interval. The raw fallback
+						// fingerprint drifts with streaming text (2026-09-06
+						// compact noise), and phantom anchors — the detector's
+						// own source shown in the pane, same incident — must
+						// not spam either. No card is emitted for these.
+						s.setQFP(fp)
 						s.emit(core.Event{Type: core.EventText, Content: "❓ opencode 正在等待选择（问题：" + questionPreview(qblock) + "）——弹窗解析失败，请到主机窗口操作，完成后回合自动继续"})
 					}
 				}
+			} else if qMiss++; qMiss < 2 {
+				// Single torn frame: keep the state, avoid a duplicate card on
+				// re-detection (2026-09-06).
 			} else {
-				if fp, answered := s.qState(); fp != "" && !answered {
+				if fp, answered, card := s.qState(); fp != "" && !answered && card {
 					// The dialog vanished WITHOUT an IM answer (answered or
-					// dismissed on the host). The engine's pending card, if
-					// one went out, stays unresolved and BLOCKS its turn
-					// loop until the next IM message is consumed as the
-					// answer (engine resolves pending on any message —
-					// handlePendingPermission). Nothing the agent can emit
-					// reaches it, so log the wedge shape for diagnosis; the
-					// 2026-09-05 incident surfaced exactly this state.
+					// dismissed on the host). The engine's pending card stays
+					// unresolved and BLOCKS its turn loop until the next IM
+					// message is consumed as the answer (handlePendingPermission).
+					// Nothing the agent can emit reaches it, so log the wedge
+					// shape for diagnosis. card==false appearances only ever sent
+					// a fallback notice — nothing can orphan, stay silent
+					// (2026-09-06: compact noise false-warned here).
 					slog.Warn(agentName+": question dialog gone without IM answer (host-side action?) — an orphaned IM card, if any, resolves on the next message", "fingerprint", fp)
 				}
 				s.clearQDialog() // dialog gone (answered/dismissed on the host side)
@@ -596,7 +639,7 @@ func (s *paneSession) pollTurn(promptEcho string, pollInterval, streamInterval t
 // fresh session. Synchronous on purpose — /new is not a turn.
 func (s *paneSession) runNewSession() error {
 	if s.waitPane(func(c string) bool {
-		return strings.Contains(c, paneIdleHint) && !paneBusy(c)
+		return paneIdle(c) && !paneBusy(c)
 	}, 2*time.Second) {
 		s.mu.Lock()
 		sesID := s.sesID
@@ -640,12 +683,44 @@ func (s *paneSession) SelfCheck() string {
 	return "⚠ 窗口界面契约异常：读不到 opencode 的任何界面锚点（busy/空闲提示/底栏）——opencode 可能已升级或窗口里不是 opencode，请按 README 升级验收清单排查"
 }
 
-// paneAnchorsReadable is the pure predicate behind SelfCheck.
+// paneZoneStart returns the index where the zone of the last n non-empty
+// lines begins; 0 when the capture has fewer (short frames — every unit
+// fixture — keep whole-pane semantics).
+func paneZoneStart(lines []string, n int) int {
+	start := len(lines)
+	for i := len(lines) - 1; i >= 0 && n > 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		start = i
+		n--
+	}
+	if n > 0 {
+		return 0
+	}
+	return start
+}
+
+// paneAnchorsReadable is the pure predicate behind SelfCheck. Zone-scoped:
+// the busy marker, idle hint, and model bar all live in the bottom chrome
+// zone; transcript echoes above must neither fake health nor mask drift.
 func paneAnchorsReadable(cap string) bool {
-	if strings.Contains(cap, paneBusyMarker) || strings.Contains(cap, paneIdleHint) {
+	lines := strings.Split(cap, "\n")
+	chrome := strings.Join(lines[paneZoneStart(lines, paneChromeZone):], "\n")
+	if strings.Contains(chrome, paneBusyMarker) || strings.Contains(chrome, paneIdleHint) {
 		return true
 	}
-	return paneBarRe.FindString(cap) != ""
+	return paneBarRe.FindString(chrome) != ""
+}
+
+// paneIdle reports whether the bottom chrome zone shows the idle hint —
+// the /new confirmation must read live chrome only; README/code echoes
+// of the hint text up in the transcript must not confirm (zone-scoped
+// 2026-09-06).
+func paneIdle(cap string) bool {
+	lines := strings.Split(cap, "\n")
+	chrome := strings.Join(lines[paneZoneStart(lines, paneChromeZone):], "\n")
+	return strings.Contains(chrome, paneIdleHint)
 }
 
 // emit never panics even when Close races a pending send (the recover guards
@@ -1029,25 +1104,64 @@ func paneRowMatches(row, name, provider string) bool {
 	return false
 }
 
-// parseModelDialogRows extracts the model rows from a "Select model" dialog
-// capture. The search input is skipped BY POSITION (the first line after
-// the header): its text can be identical to the target row ("GLM-5.3
-// OpenCode Go"), so content-based echo detection would eat real rows.
-// Section headers and the ASCII-art empty state are skipped too.
+// modelDialogLocate finds the floating model dialog: its action-bar
+// footer row (bottom-up) and the NEAREST header above it. The footer
+// row must pair "Connect provider" with its probed companion hints
+// (ctrl+a / Favorites) — the README zone doc quotes the bare words
+// "Connect provider", so a lone token is echo-quotable while the real
+// bar always carries the pair.
+func modelDialogLocate(lines []string) (header, foot int) {
+	foot = -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		t := lines[i]
+		if strings.Contains(t, "Connect provider") &&
+			(strings.Contains(t, "ctrl+a") || strings.Contains(t, "Favorites")) {
+			foot = i
+			break
+		}
+	}
+	if foot < 0 {
+		return -1, -1
+	}
+	header = -1
+	for j := foot - 1; j >= 0 && j >= foot-40; j-- {
+		if strings.Contains(lines[j], "Select model") {
+			header = j
+			break
+		}
+	}
+	return header, foot
+}
+
+// modelDialogPresent reports whether the model dialog overlay is up. The
+// dialog is a floating overlay (header height varies with the list
+// length — probed 2026-09-06 at 31 rows from the bottom), so it cannot
+// be bottom-anchored; the header+footer PAIR is the anchor. Transcript
+// echoes quote the header (or the footer words) alone, never the pair.
+func modelDialogPresent(cap string) bool {
+	header, foot := modelDialogLocate(strings.Split(cap, "\n"))
+	return header >= 0 && foot >= 0
+}
+
+// parseModelDialogRows extracts the model rows from the region between
+// the located header (nearest above the action bar) and the footer —
+// parsing anchored to the same pair modelDialogLocate finds, so an
+// echoed "Select model" line above the real dialog can never feed
+// garbage rows (2026-09-06). The search input is skipped BY POSITION
+// (the first line after the header): its text can be identical to the
+// target row ("GLM-5.3 OpenCode Go"), so content-based echo detection
+// would eat real rows. Section headers and the ASCII-art empty state
+// are skipped too.
 func parseModelDialogRows(cap string) []string {
 	lines := strings.Split(cap, "\n")
+	header, foot := modelDialogLocate(lines)
+	if header < 0 || foot < 0 {
+		return nil // no header+action-bar pair: echoed text, not the dialog
+	}
 	var rows []string
-	inDialog := false
 	skippedInput := false
-	for _, l := range lines {
+	for _, l := range lines[header+1 : foot] {
 		t := strings.TrimSpace(l)
-		if strings.Contains(l, "Select model") {
-			inDialog = true
-			continue
-		}
-		if !inDialog {
-			continue
-		}
 		if t == "" {
 			if len(rows) > 0 {
 				break
@@ -1107,7 +1221,7 @@ func (s *paneSession) SetLiveModel(target string) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if !s.waitPane(func(c string) bool { return strings.Contains(c, "Select model") }, 2*time.Second) {
+	if !s.waitPane(modelDialogPresent, 2*time.Second) {
 		return abort(fmt.Errorf("pane: 模型对话框未打开"))
 	}
 	idx, err := s.searchModelDialog(name, provider)
@@ -1131,7 +1245,7 @@ func (s *paneSession) SetLiveModel(target string) error {
 			if bar != "" && paneRowMatches(bar, name, provider) {
 				return nil
 			}
-			if !strings.Contains(cap, "Select model") {
+			if !modelDialogPresent(cap) {
 				return fmt.Errorf("pane: 切换后底栏为 %q，与目标 %q 不符", bar, target)
 			}
 		}
@@ -1406,10 +1520,21 @@ func (s *paneSession) Abort() error {
 // selection, or the multi-question Confirm page is up (all of them hide
 // the hint while they are up).
 func paneBusy(cap string) bool {
-	if strings.Contains(cap, paneBusyMarker) {
+	// Zone-scoped union (2026-09-06): the pane renders the agent's own
+	// output above the chrome; full-pane Contains on echoed anchor text
+	// kept busy true forever after a compact (IM wedged on the busy
+	// reply). The busy marker lives in the spinner row (bottom-most), the
+	// perm-confirm page is held by its marker PLUS the bottom-anchored
+	// Confirm/Cancel options pair.
+	lines := strings.Split(cap, "\n")
+	if lo := paneZoneStart(lines, paneBusyZone); strings.Contains(
+		strings.Join(lines[lo:], "\n"), paneBusyMarker) {
 		return true
 	}
-	if strings.Contains(cap, permConfirmMarker) {
+	chrome := strings.Join(lines[paneZoneStart(lines, paneDialogZone):], "\n")
+	foot := strings.Join(lines[paneZoneStart(lines, paneFootZone):], "\n")
+	if strings.Contains(chrome, permConfirmMarker) &&
+		strings.Contains(foot, "Confirm") && strings.Contains(foot, "Cancel") {
 		return true
 	}
 	if _, ok := extractPermDialog(cap); ok {
@@ -1439,12 +1564,13 @@ func (s *paneSession) currentQFP() string {
 	return s.qFP
 }
 
-// qState returns the question-dialog fingerprint and whether the current
-// dialog was already answered from IM.
-func (s *paneSession) qState() (fp string, answered bool) {
+// qState returns the question-dialog fingerprint, whether the current
+// dialog was already answered from IM, and whether a real card (not a
+// fallback notice) was emitted for it.
+func (s *paneSession) qState() (fp string, answered, card bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.qFP, s.qAnswered
+	return s.qFP, s.qAnswered, s.qCard
 }
 
 // setQFP records the emitted dialog's fingerprint and resets the answered
@@ -1453,7 +1579,32 @@ func (s *paneSession) setQFP(fp string) {
 	s.mu.Lock()
 	s.qFP = fp
 	s.qAnswered = false
+	s.qCard = false
 	s.mu.Unlock()
+}
+
+// markQCard flags the current page as card-carrying (emitted as an
+// AskUserQuestion permission request).
+func (s *paneSession) markQCard() {
+	s.mu.Lock()
+	s.qCard = true
+	s.mu.Unlock()
+}
+
+// allowFallbackNotice gates the L1 host-window notice: at most one per
+// questionFallbackMinInterval, globally. The fallback fingerprint is a
+// raw-content hash that drifts with streaming text (2026-09-06 compact
+// noise: four identical notices in 12s; self-display phantoms flicker
+// worse), so dedup-by-fingerprint cannot bound the spam — time does.
+func (s *paneSession) allowFallbackNotice() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if !s.qLastFallback.IsZero() && now.Sub(s.qLastFallback) < questionFallbackMinInterval {
+		return false
+	}
+	s.qLastFallback = now
+	return true
 }
 
 // markQAnswered keeps the fingerprint (suppressing re-emit while the
@@ -1466,11 +1617,13 @@ func (s *paneSession) markQAnswered() {
 	s.mu.Unlock()
 }
 
-// clearQDialog drops both markers (dialog gone or stale request).
+// clearQDialog drops the page markers (dialog gone or stale request);
+// qLastFallback deliberately survives (global rate limit).
 func (s *paneSession) clearQDialog() {
 	s.mu.Lock()
 	s.qFP = ""
 	s.qAnswered = false
+	s.qCard = false
 	s.mu.Unlock()
 }
 
@@ -1501,15 +1654,29 @@ func (s *paneSession) clearQDialog() {
 // separated by that blank and never enters the block.
 func extractQuestionDialog(cap string) (string, bool) {
 	lines := strings.Split(cap, "\n")
+	// Bottom-anchored (2026-09-06): the dialog footer renders inside the
+	// bottom foot zone; a quoted footer up in the transcript never anchors
+	// (the compact-summary wedge). The walk-up is bounded by the dialog
+	// zone so transcript junk above the dialog cannot enter the block.
+	footLo := paneZoneStart(lines, paneFootZone)
+	dialogLo := paneZoneStart(lines, paneDialogZone)
 	foot := -1
-	for i := len(lines) - 1; i >= 0; i-- {
+	for i := len(lines) - 1; i >= footLo; i-- {
 		l := lines[i]
 		// Single-question footers say "enter submit"; multi-question
 		// QUESTION pages say "enter confirm" (their final Confirm page
 		// says "enter submit" again but has NO "select" — probed
 		// 2026-09-05). "select" is what keeps the Confirm page out.
 		hasEnter := strings.Contains(l, "enter submit") || strings.Contains(l, "enter confirm")
-		if strings.Contains(l, "select") && hasEnter && strings.Contains(l, "esc dismiss") {
+		// Real footers carry a key-hint glyph run that prose never quotes:
+		// 1.18.28 renders "⇆ select ...", 1.18.29 renders "↑↓ select ..."
+		// (probed live 2026-09-06 — the ⇆-only gate failed live smoke on
+		// 1.18.29). Flowing text (chat, the summary shown during /compact) can
+		// quote the three token words but not these glyphs: requiring one of
+		// them keeps quoted-token lines from anchoring at all (2026-09-06
+		// compact incident: the agent's own summary quoting the anchor
+		// discipline fired a fallback notice).
+		if (strings.Contains(l, "⇆") || strings.Contains(l, "↑↓")) && strings.Contains(l, "select") && hasEnter && strings.Contains(l, "esc dismiss") {
 			foot = i
 			break
 		}
@@ -1526,7 +1693,7 @@ func extractQuestionDialog(cap string) (string, bool) {
 	// Walk up from the footer (skipping chrome rows) to the LAST option
 	// row — the numbered free-text entry or the lowest real option.
 	lastOpt := -1
-	for j := foot - 1; j >= 0 && j >= foot-questionChromeSpan; j-- {
+	for j := foot - 1; j >= dialogLo && j >= foot-questionChromeSpan; j-- {
 		l := trimGutter(lines[j])
 		if l == "" {
 			continue
@@ -1541,8 +1708,8 @@ func extractQuestionDialog(cap string) (string, bool) {
 		// L1 fallback rely on detection) — return the legacy span block;
 		// parseQuestionPage will fail on it and degrade to the L1 notice.
 		start := foot - questionDialogSpan
-		if start < 0 {
-			start = 0
+		if start < dialogLo {
+			start = dialogLo
 		}
 		return strings.TrimSpace(strings.Join(lines[start:foot+1], "\n")), true
 	}
@@ -1550,7 +1717,7 @@ func extractQuestionDialog(cap string) (string, bool) {
 	// description when the row BELOW it is an option row; anything else
 	// ends the region.
 	top := lastOpt
-	for k := lastOpt; k >= 0; k-- {
+	for k := lastOpt; k >= dialogLo; k-- {
 		l := trimGutter(lines[k])
 		if l == "" {
 			break
@@ -1569,11 +1736,11 @@ func extractQuestionDialog(cap string) (string, bool) {
 	// qEnd is the block START (above the options); degenerate only when no
 	// content exists above the option region.
 	q := top - 1
-	for q >= 0 && trimGutter(lines[q]) == "" {
+	for q >= dialogLo && trimGutter(lines[q]) == "" {
 		q--
 	}
 	qEnd := q
-	for q >= 0 && trimGutter(lines[q]) != "" {
+	for q >= dialogLo && trimGutter(lines[q]) != "" {
 		qEnd = q
 		q--
 	}
@@ -1623,9 +1790,13 @@ var paneNumberedOptionLabelRe = regexp.MustCompile(`^(\d+)\.\s+(.*)$`)
 // pages' footers always have "select". Probed 2026-09-05 (opencode
 // 1.18.28).
 func isQuestionConfirmPage(cap string) bool {
-	for _, l := range strings.Split(cap, "\n") {
-		t := strings.TrimSpace(l)
-		if strings.Contains(t, "⇆ tab") && strings.Contains(t, "enter submit") &&
+	// Bottom-anchored like the question footer: quoted confirm footers in
+	// the transcript must not count (zone-scoped 2026-09-06).
+	lines := strings.Split(cap, "\n")
+	lo := paneZoneStart(lines, paneFootZone)
+	for i := len(lines) - 1; i >= lo; i-- {
+		t := strings.TrimSpace(lines[i])
+		if (strings.Contains(t, "⇆") || strings.Contains(t, "↑↓")) && strings.Contains(t, "enter submit") &&
 			strings.Contains(t, "esc dismiss") && !strings.Contains(t, "select") {
 			return true
 		}
@@ -1666,6 +1837,34 @@ func parseQuestionPage(block string) (q core.UserQuestion, nums []int, freeIdx i
 	if len(rows) == 0 {
 		return q, nil, 0, false
 	}
+	// Strict shape (2026-09-06 incident): the dialog's numbered rows run
+	// 1..N consecutively with the free-text entry LAST. Phantom frames —
+	// the detector's own source or binary strings rendered in the pane —
+	// matched the footer anchor and twice assembled enough junk to parse,
+	// emitting cards that hijacked IM messages as their answers. Random
+	// text essentially never satisfies the strict shape. Question text
+	// itself may carry enumerated lines ("1. fast") above the options, so
+	// the check targets the longest SUFFIX of rows numbered 1..N; leading
+	// junk rows are ignored, and no valid suffix means no dialog.
+	validSuffix := func(rs []optRow) bool {
+		for i, r := range rs {
+			if r.n != i+1 {
+				return false
+			}
+		}
+		return strings.Contains(rs[len(rs)-1].label, "Type your own answer")
+	}
+	start := -1
+	for k := range rows {
+		if validSuffix(rows[k:]) {
+			start = k
+			break
+		}
+	}
+	if start < 0 {
+		return q, nil, 0, false
+	}
+	rows = rows[start:]
 	for _, r := range rows {
 		if strings.Contains(r.label, "Type your own answer") {
 			freeIdx = r.n
@@ -1783,25 +1982,36 @@ func questionPreview(block string) string {
 // lines from the "Permission required" header through the options row. The
 // block is stable while the dialog waits (unlike the whole pane, which has
 // a running spinner/timer), so its hash works as a dedup fingerprint.
+// extractPermDialog pulls the permission dialog out of a capture. The
+// real dialog is bottom-anchored (probed 2026-09-06): the options row —
+// "Allow once   Allow always   Reject" — sits in the bottom foot zone,
+// the header up to ~10 non-empty rows above it on its OWN row. Search is
+// options-first with a bounded walk-up: a transcript echo can quote the
+// two tokens on ONE line (README anchor lists) or above the chrome —
+// start < end on separate rows inside the zones excludes every echo
+// shape (2026-09-06 wedge).
 func extractPermDialog(cap string) (string, bool) {
 	lines := strings.Split(cap, "\n")
+	footLo := paneZoneStart(lines, paneFootZone)
+	end := -1
+	for i := len(lines) - 1; i >= footLo; i-- {
+		if strings.Contains(lines[i], "Allow once") {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return "", false
+	}
 	start := -1
-	for i, l := range lines {
-		if strings.Contains(l, "Permission required") {
-			start = i
+	for j := end - 1; j >= 0 && j >= end-25; j-- {
+		if strings.Contains(lines[j], "Permission required") {
+			start = j
 			break
 		}
 	}
 	if start < 0 {
 		return "", false
-	}
-	end := start
-	for j := start + 1; j < len(lines) && j < start+15; j++ {
-		if strings.Contains(lines[j], "Allow once") {
-			end = j
-			break
-		}
-		end = j
 	}
 	return strings.TrimSpace(strings.Join(lines[start:end+1], "\n")), true
 }

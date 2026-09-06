@@ -260,19 +260,42 @@ helper 手工构造展开文本，绕过了真实引擎），升级后按此清�
 ### opencode 升级后
 
 **第一步先跑机器门禁**（沙盒 tmux + 真实 opencode，走生产代码路径，四阶段：TUI
-启动 / 锚点自检 / 回合回环 / 权限弹窗 / question 通知，约 40s、消耗少量 token）：
+启动 / 锚点自检 / 回合回环 / 权限弹窗 / question 卡片（L2；解析失败才降级为通知），约 40-60s、消耗少量 token）：
 
 ```bash
 go test -tags live -run TestLivePaneSmoke -v -timeout 600s ./agent/llmw/
 ```
 
-红了再看锚点细节。TUI 屏幕文本锚点（大版本改版需重新探测，锚点定义都在
+红了再看锚点细节。**先看内存再跑**：沙盒会再拉起一个完整 opencode（约 1GB
+RSS），本机 3.5GB 无 swap——2026-09-06 曾因多 opencode 叠加把主机硬压死
+（14:14 冻结）。测试已加守卫（MemAvailable < 1500MB 自动 skip），手动跑前
+`free -m` 确认余量。TUI 屏幕文本锚点（大版本改版需重新探测，锚点定义都在
 `pane_inner.go` 顶部常量/注释）：`esc interrupt`（busy）、`Permission required` /
 `Allow once`（权限页 1）、`This will allow the following patterns`（权限页 2）、
 `↑↓ select / enter submit（或 enter confirm）/ esc dismiss`（question 弹窗——
 多问题页是 enter confirm）、`⇆ tab enter submit esc dismiss` 且无 select
 （多问题 Confirm 页，pane 自动提交）、`Select model`（模型
-对话框）、`Build · <model>`（底栏）。单元测试只喂合成帧、升级时不红——live 冒烟
+对话框）、`Build · <model>`（底栏）。
+
+**页脚跨版本漂移**（2026-09-06 实测）：1.18.28 单问题页脚是 `⇆ select …`，
+1.18.29 是 `↑↓ select …`（无 ⇆）——锚点闸接受二者任一（⇆ 或 ↑↓ 按键提示符），
+同时杜绝散文误锚（/compact 期间摘要逐字引用 token 的事故，散文永远不带这些
+符号）。1.18.29 的多问题 Confirm 页页脚未验证——pane 升级 1.18.29 后需跑 live
+冒烟 + 多问题人工验证一遍。
+
+**锚点只认底部区域（2026-09-06 事故）**：共享 pane 会把 agent 自己的工具
+输出全部渲染在滚动区——回显文本可以逐字引用任何锚点（探测命令引用 busy
+标记、README/代码引用权限文案），全屏 Contains 会把空闲 pane 永远判成
+"正忙"（IM 卡死在 busy 回复）甚至伪造弹窗往空闲窗口注入按键。TUI 的
+活 chrome（弹窗/输入框/状态栏）永远贴底渲染，所以所有锚点检测按
+`pane_inner.go` 的 zone 常量从底部数：busy 标记=底部 2 行非空（spinner
+行就是最底行）、空闲提示/健康检查/`/llmw_new` 确认=底部 9 行、弹窗块=
+底部 30 行（高弹窗不截断）、弹窗页脚/选项行=底部 5 行、权限 header 回溯
+≤25 行；模型对话框是浮动 overlay 不贴底，用"header + 同行带 ctrl+a/
+Favorites 的 Connect provider 行"配对闸（裸 Connect provider 词可被
+README 引文回显），行解析只取就近 header↔footer 区间。撕裂帧（重绘中
+的半空 capture）连续 2 帧未检出弹窗才清状态，防止同卡重复发。opencode 大版本升级后除锚点文案外还要
+复探这些 zone 深度（live 冒烟覆盖 busy/权限/question 三类）。单元测试只喂合成帧、升级时不红——live 冒烟
 才是对真实 TUI 的把关。人工冒烟（冒烟测试没覆盖的部分）：`/model` 切换、
 `/llmw_abort` 中止、点一次 Allow always（两级确认）、**触发一次 question 工具**
 （按钮卡出现 → 点选项 / 回数字 / 回自由文本三种路径各验一次）。任一行为异常即重新沙盒探测
@@ -288,4 +311,6 @@ go test -tags live -run TestLivePaneSmoke -v -timeout 600s ./agent/llmw/
 | 消息发出无回复 | `llmw status` 看窗口 state；llmw-connect 日志（`journalctl -u llmw-connect`）grep `llmw pane`；窗口是否被主机占用（busy 闸门会拒发） |
 | 回复"会话末尾不是本回合输入" | 主机在共享窗口插话触发 sticky echo 防错发保护；稍后重发即可 |
 | **IM 卡住不回、卡片点了没反应**（2026-09-05 实测） | 先看 journalctl 有无 `gone without IM answer` warn——question 弹窗在主机侧被答掉后，IM 孤儿卡挂起引擎 pending。**恢复：IM 随便发一条消息**（会被当作该卡的答案消费、resolve pending、回合解锁，不会重复执行）；仍不行 `systemctl restart llmw-connect` + `/llmw_enter`。若 journal 同一弹窗连续多条 `permission request` 不同 id = fingerprint 漂移（旧版缺陷，v1.5.0-llmw.6 已修——升级二进制） |
+| **compact/长回合结束后 IM 永远回"窗口正忙"**（2026-09-06 实测） | 回显区引用了锚点原文（探测命令/代码/README 引文），旧版全屏 Contains 被永久卡 busy | 已修：锚点只认底部 zone（busy=底 2 行非空等，见上）；恢复 = `systemctl restart llmw-connect` |
+| **IM 消息被静默吃掉、伴随"弹窗解析失败"通知刷屏**（2026-09-06 实测） | 共享窗口显示了含 footer 锚点的文本（agent 排查时把检测器源码/二进制字符串打上屏）→ 幻影弹窗误检成真卡 → 引擎 pending 吃掉后续 IM 消息。**恢复：`systemctl restart llmw-connect` 清 pending**。已修（严格解析 + 通知限速 + 仅真卡告警，2026-09-06）；排查检测器问题时避免在共享窗口打印锚点原文（写 /tmp 文件再定点 grep） |
 | 权限按钮点了没反应 | 看窗口弹窗是否已被主机手动回答（此时 IM 按钮变 no-op 属预期） |

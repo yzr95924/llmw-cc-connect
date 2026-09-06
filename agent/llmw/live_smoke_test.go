@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,24 @@ const liveSmokeSession = "llmw-smoke"
 
 func liveSmokeTmux(args ...string) error {
 	return exec.Command("tmux", args...).Run()
+}
+
+// liveSmokeMemAvailableMB reports free headroom. The sandbox spawns a full
+// opencode instance (~1GB RSS): on the 3.5GB swapless dev VM the
+// 2026-09-06 14:14 hard freeze landed with three opencode residents plus
+// build caches — the gate must not add another under pressure.
+func liveSmokeMemAvailableMB() int {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 1 << 30 // unreadable: do not block the gate
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(l, "MemAvailable:") {
+			n, _ := strconv.Atoi(strings.Fields(l)[1])
+			return n / 1024
+		}
+	}
+	return 1 << 30
 }
 
 // liveSmokeWaitEvent reads session events until a match or timeout; the
@@ -62,6 +81,10 @@ func TestLivePaneSmoke(t *testing.T) {
 		if _, err := exec.LookPath(bin); err != nil {
 			t.Fatalf("%s not in PATH: %v", bin, err)
 		}
+	}
+	// Resource guard (2026-09-06 host freeze, see liveSmokeMemAvailableMB).
+	if avail := liveSmokeMemAvailableMB(); avail < 1500 {
+		t.Skipf("only %dMB MemAvailable (need 1500MB): spawning the sandbox opencode would risk freezing the swapless host", avail)
 	}
 	// Refuse to reuse an existing session — never kill a foreign one.
 	if liveSmokeTmux("has-session", "-t", liveSmokeSession) == nil {
@@ -120,14 +143,26 @@ func TestLivePaneSmoke(t *testing.T) {
 	}
 	t.Log("stage 3 ✓ permission dialog (page-1 anchor + key mapping + allow)")
 
-	// ---- Stage 4: question dialog notification (footer anchor) ----
+	// ---- Stage 4: question dialog — L2 card preferred, L1 notice ok ----
+	// Since the L2 button-card feature a REAL parseable dialog emits an
+	// EventPermissionRequest (IM buttons); only unparseable dialogs degrade
+	// to the L1 host-window notice. Accept either, record which fired.
 	if err := s.Send("Use the question tool to ask me: coffee or tea? Then wait for my answer.", "", nil, nil); err != nil {
 		t.Fatalf("stage 4: Send: %v", err)
 	}
-	liveSmokeWaitEvent(t, s.Events(), 90*time.Second, func(ev core.Event) bool {
+	cardPath := false
+	ev, _ := liveSmokeWaitEvent(t, s.Events(), 90*time.Second, func(ev core.Event) bool {
+		if ev.Type == core.EventPermissionRequest && ev.ToolName == "AskUserQuestion" {
+			cardPath = true
+			return true
+		}
 		return ev.Type == core.EventText && strings.Contains(ev.Content, "等待选择")
 	})
-	t.Log("stage 4 ✓ question dialog notification (footer anchor)")
+	if cardPath {
+		t.Logf("stage 4 ✓ question dialog L2 card (%s)", ev.RequestID)
+	} else {
+		t.Log("stage 4 ~ question dialog degraded to the L1 notice (strict parse failed — check layout)")
+	}
 	// Dismiss the dialog on the host side (as the user would with ESC) and
 	// let the turn wind down; the reply may be anything.
 	s.runner.sendKey("Escape")

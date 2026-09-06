@@ -821,7 +821,7 @@ func TestExtractQuestionDialogTightBlock(t *testing.T) {
 		"  ┃     tea\n" +
 		"  ┃  3. Type your own answer\n" +
 		"  ┃  master\n" +
-		"  ┃  ↑↓ select  enter submit  esc dismiss\n"
+		"  ┃  ⇆ select  enter submit  esc dismiss\n"
 	block, ok := extractQuestionDialog(cap)
 	if !ok {
 		t.Fatal("dialog not detected under streamed junk")
@@ -968,8 +968,230 @@ func TestNoReemitAfterIMAnswer(t *testing.T) {
 		t.Fatalf("sentTexts = %v, want the single answer digit", got)
 	}
 	// And the markers are clean after the dialog is gone.
-	if fpA, answered := s.qState(); fpA != "" || answered {
-		t.Fatalf("qState = (%q, %v), want cleared after dialog gone", fpA, answered)
+	if fpA, answered, card := s.qState(); fpA != "" || answered || card {
+		t.Fatalf("qState = (%q, %v, %v), want cleared after dialog gone", fpA, answered, card)
+	}
+}
+
+// phantomFrame renders the 2026-09-06 incident shape: pane text that
+// CONTAINS the footer anchor verbatim (the detector's own source shown on
+// screen) plus junk numbered rows — never a real dialog. The anchor line
+// is assembled at runtime: this file must not carry the token trio on one
+// line, or the live daemon watching this pane would detect its own test.
+func phantomFrame(drift string) string {
+	foot := "  ┃  ⇆ select  enter " + "sub" + "mit  esc " + "dis" + "miss"
+	return "  ┃  $ grep -n 'func extract' agent/llmw/pane_inner.go\n" +
+		"  ┃  " + drift + "\n" +
+		"  ┃  2. stable fingerprint → injection works " + drift + "\n" +
+		"  ┃  7. master branch row\n" +
+		"  ┃                                                                  /tmp/opencode/probe\n" +
+		foot + "\n"
+}
+
+// The incident regression: footer-matched junk must NEVER emit a card
+// (cards hijack IM messages as answers), and the L1 fallback notice fires
+// at most once while the junk drifts across ticks.
+func TestPhantomAnchorNoCardNoSpam(t *testing.T) {
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_ph", Directory: "/ws/foo", Updated: 9000}})
+	e := ocExport{}
+	e.Messages = append(e.Messages, ocMsg("user", "hi"), ocMsg("assistant", "done"))
+	r.exports["ses_ph"] = marshalExport(t, e)
+	r.captures = []string{
+		"idle ctrl+p",
+		"working esc interrupt",
+		phantomFrame("tick A"),
+		phantomFrame("tick B"),
+		phantomFrame("tick C"),
+		phantomFrame("tick C"),
+		"idle ctrl+p",
+		"idle ctrl+p",
+	}
+	r.mu.Unlock()
+
+	if err := s.Send("hi", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	cards, notices := 0, 0
+	deadline := time.After(3 * time.Second)
+	done := false
+	for !done {
+		select {
+		case ev := <-s.Events():
+			switch ev.Type {
+			case core.EventPermissionRequest:
+				cards++
+			case core.EventText:
+				if strings.Contains(ev.Content, "弹窗解析失败") {
+					notices++
+				}
+			case core.EventResult:
+				done = ev.Done
+			}
+		case <-deadline:
+			t.Fatal("no result event within timeout")
+		}
+	}
+	if cards != 0 {
+		t.Fatalf("cards = %d, want 0 (phantom anchors must never emit cards)", cards)
+	}
+	if notices > 1 {
+		t.Fatalf("fallback notices = %d, want <= 1 across drifting ticks", notices)
+	}
+	if got := r.SentTexts(); len(got) != 0 {
+		t.Fatalf("sentTexts = %v, want none (no keys injected for phantoms)", got)
+	}
+	if fp, answered, card := s.qState(); fp != "" || answered || card {
+		t.Fatalf("qState = (%q, %v, %v), want cleared after dialog gone", fp, answered, card)
+	}
+}
+
+// Prose quoting the anchor token words WITHOUT the footer glyph must stay
+// COMPLETELY silent: during /llmw_compact the TUI shows the session
+// summary, and the agent's own summary quoted the discipline line
+// token-for-token (2026-09-06 second incident) — the glyph gate in
+// extractQuestionDialog keeps this class from anchoring at all, so not
+// even the rate-limited L1 notice may fire. Assembled at runtime like
+// phantomFrame: this file must not carry the token trio on one line.
+func TestProseQuotingTokensSilent(t *testing.T) {
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_prose", Directory: "/ws/foo", Updated: 9000}})
+	e := ocExport{}
+	e.Messages = append(e.Messages, ocMsg("user", "hi"), ocMsg("assistant", "done"))
+	r.exports["ses_prose"] = marshalExport(t, e)
+	prose := func(drift string) string {
+		line := "  \u2503  - never render on one line: \"select\" + \"" + "enter submit" +
+			"\" / \"" + "enter confirm" + "\" + \"" + "esc dismiss" + "\" " + drift
+		return "  \u2503  ## Important Details\n" +
+			"  \u2503  - the shared pane renders all tool output\n" +
+			line + "\n" +
+			"  \u2503  - another summary bullet\n"
+	}
+	r.captures = []string{
+		"idle ctrl+p",
+		"working esc interrupt",
+		prose("tick A"),
+		prose("tick B"),
+		prose("tick C"),
+		prose("tick C"),
+		"idle ctrl+p",
+		"idle ctrl+p",
+	}
+	r.mu.Unlock()
+
+	if err := s.Send("hi", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	cards, notices := 0, 0
+	deadline := time.After(3 * time.Second)
+	done := false
+	for !done {
+		select {
+		case ev := <-s.Events():
+			switch ev.Type {
+			case core.EventPermissionRequest:
+				cards++
+			case core.EventText:
+				if strings.Contains(ev.Content, "\u5f39\u7a97\u89e3\u6790\u5931\u8d25") {
+					notices++
+				}
+			case core.EventResult:
+				done = ev.Done
+			}
+		case <-deadline:
+			t.Fatal("no result event within timeout")
+		}
+	}
+	if cards != 0 || notices != 0 {
+		t.Fatalf("cards = %d, notices = %d; want 0/0: prose without the glyph must not anchor", cards, notices)
+	}
+	if got := r.SentTexts(); len(got) != 0 {
+		t.Fatalf("sentTexts = %v, want none", got)
+	}
+}
+
+// The rate-limit gate itself: forced to zero, drifting junk re-notifies;
+// that proves the default-interval suppression in the test above is the
+// timer's doing, not an accident of fingerprint equality.
+func TestFallbackRateLimitGate(t *testing.T) {
+	old := questionFallbackMinInterval
+	questionFallbackMinInterval = 0
+	defer func() { questionFallbackMinInterval = old }()
+
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_rl", Directory: "/ws/foo", Updated: 9000}})
+	e := ocExport{}
+	e.Messages = append(e.Messages, ocMsg("user", "hi"), ocMsg("assistant", "done"))
+	r.exports["ses_rl"] = marshalExport(t, e)
+	r.captures = []string{
+		"idle ctrl+p",
+		"working esc interrupt",
+		phantomFrame("d1"),
+		phantomFrame("d2"),
+		phantomFrame("d3"),
+		"idle ctrl+p",
+		"idle ctrl+p",
+	}
+	r.mu.Unlock()
+
+	if err := s.Send("hi", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	notices := 0
+	deadline := time.After(3 * time.Second)
+	done := false
+	for !done {
+		select {
+		case ev := <-s.Events():
+			switch ev.Type {
+			case core.EventText:
+				if strings.Contains(ev.Content, "弹窗解析失败") {
+					notices++
+				}
+			case core.EventResult:
+				done = ev.Done
+			}
+		case <-deadline:
+			t.Fatal("no result event within timeout")
+		}
+	}
+	if notices < 2 {
+		t.Fatalf("notices = %d, want >= 2 with the gate forced open", notices)
+	}
+}
+
+// parseQuestionPage strict shape (2026-09-06): numbered rows must run
+// 1..N with the free-text entry last; enumerated QUESTION text above the
+// options must not break the parse (longest valid suffix wins).
+func TestParseQuestionPageStrictShape(t *testing.T) {
+	if _, _, _, ok := parseQuestionPage(questionDialogFrame("q?", "a", "b")); !ok {
+		t.Fatal("fixture frame must parse")
+	}
+	gap := "  ┃\n  ┃  pick one\n  ┃\n  ┃  1. a\n  ┃  2. b\n  ┃  4. Type your own answer\n"
+	if _, _, _, ok := parseQuestionPage(gap); ok {
+		t.Fatal("numbering gap (1,2,4) must be rejected")
+	}
+	entryNotLast := "  ┃\n  ┃  pick one\n  ┃\n  ┃  1. a\n  ┃  2. Type your own answer\n  ┃  3. b\n"
+	if _, _, _, ok := parseQuestionPage(entryNotLast); ok {
+		t.Fatal("free-text entry not last must be rejected")
+	}
+	noSuffix := "  ┃\n  ┃  pick one\n  ┃\n  ┃  2. x\n  ┃  5. y\n  ┃  9. Type your own answer\n"
+	if _, _, _, ok := parseQuestionPage(noSuffix); ok {
+		t.Fatal("no 1..N suffix must be rejected")
+	}
+	enumQ := "  ┃\n  ┃  choose mode:\n  ┃  1. fast\n  ┃  2. slow\n  ┃\n  ┃  1. fast\n  ┃  2. slow\n  ┃  3. Type your own answer\n"
+	q, nums, freeIdx, ok := parseQuestionPage(enumQ)
+	if !ok {
+		t.Fatal("enumerated question text above options must still parse (suffix)")
+	}
+	if len(q.Options) != 2 || q.Options[0].Label != "fast" || q.Options[1].Label != "slow" {
+		t.Fatalf("options = %+v, want fast/slow from the suffix region", q.Options)
+	}
+	if !reflect.DeepEqual(nums, []int{1, 2}) || freeIdx != 3 {
+		t.Fatalf("nums = %v freeIdx = %d, want [1 2] / 3", nums, freeIdx)
 	}
 }
 
@@ -1724,5 +1946,308 @@ func TestPaneCompactTurn(t *testing.T) {
 	r.mu.Unlock()
 	if exports != 0 {
 		t.Fatalf("exports armed = %d, want 0 (no reply extraction for compact)", exports)
+	}
+}
+
+// TestEchoImmunityAllAnchors is the 2026-09-06 wedge regression: the pane
+// renders the agent's own tool output above the chrome, and echoes of
+// EVERY anchor (probe commands quoting the busy marker, code quotes of the
+// perm-confirm sentence, README anchor lists quoting the question footer
+// WITH its glyph and the confirm footer without select, "Select model"
+// quotes) kept paneBusy true forever — IM was stuck on the busy reply
+// after a compact. A pane whose transcript carries all those echoes but
+// whose chrome is idle must read idle and healthy, and no detector may
+// fire. Tokens are assembled at runtime (phantomFrame discipline).
+func TestEchoImmunityAllAnchors(t *testing.T) {
+	bm := "esc " + "inter" + "rupt"
+	pc := "This will allow the following " + "pat" + "terns"
+	foot := "  ┃  ⇆ select  enter " + "sub" + "mit  esc " + "dis" + "miss"
+	confoot := "  ┃  ⇆ tab  enter " + "sub" + "mit  esc " + "dis" + "miss"
+	frame := "  ┃  print('busy' if '" + bm + "' in cap else 'not busy')\n" +
+		"  ┃  permConfirmMarker = \"" + pc + "...\"\n" +
+		"  ┃  `Permission required` / `Allow " + "once`（权限页 1）\n" +
+		"  ┃  README anchor doc: " + foot + "\n" +
+		"  ┃  README confirm doc: " + confoot + "（Confirm 页）\n" +
+		"  ┃  `Select model`（模型对话框）\n" +
+		"  ┃  working " + bm + "\n" +
+		"  ┃\n" +
+		"  ┃  Build · glm-5.3 yzr-glm-5_3-1m\n" +
+		"  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n" +
+		"  tab agents  ctrl+p commands\n"
+	if paneBusy(frame) {
+		t.Fatal("echoed anchors above the chrome must not read as busy")
+	}
+	if _, ok := extractPermDialog(frame); ok {
+		t.Fatal("same-line perm echo must not extract")
+	}
+	if _, ok := extractQuestionDialog(frame); ok {
+		t.Fatal("quoted glyph footer in the transcript must not anchor")
+	}
+	if isQuestionConfirmPage(frame) {
+		t.Fatal("quoted confirm footer in the transcript must not count")
+	}
+	if modelDialogPresent(frame) {
+		t.Fatal("quoted Select model without the action bar must not count")
+	}
+	if !paneAnchorsReadable(frame) {
+		t.Fatal("idle chrome (bar + hint) must still read healthy")
+	}
+	// Quoted footer with content BELOW it (the compact-summary wedge
+	// shape): the footer is not bottom-anchored, so it must not anchor.
+	junkBelow := "  ┃  doc: " + foot + "\n" +
+		"  ┃  streaming text below the quote\n" +
+		"  ┃  more streaming\n" +
+		"  ┃  even more\n" +
+		"  ┃  Build · glm-5.3\n" +
+		"  ╹▀▀▀▀▀▀▀▀▀▀\n" +
+		"  tab agents  ctrl+p commands\n"
+	if _, ok := extractQuestionDialog(junkBelow); ok {
+		t.Fatal("quoted footer with content below must not anchor (not bottom-anchored)")
+	}
+}
+
+// TestBusyMarkerZoneOnly: the spinner row is the bottom-most non-empty row
+// (probed on both 1.18.28 and 1.18.29); a busy-marker echo up in the
+// transcript with idle chrome below must read idle.
+func TestBusyMarkerZoneOnly(t *testing.T) {
+	bm := "esc " + "inter" + "rupt"
+	if !paneBusy("  ⬝⬝⬝⬝  " + bm + "  12.8K") {
+		t.Fatal("real spinner row must read busy")
+	}
+	echo := "  ┃  transcript quotes " + bm + " in a probe command\n" +
+		"  ┃\n" +
+		"  ┃  Build · glm-5.3\n" +
+		"  tab agents  ctrl+p commands\n"
+	if paneBusy(echo) {
+		t.Fatal("busy-marker echo above idle chrome must read idle")
+	}
+}
+
+// TestPermDialogProbedShape: the 1.18.29 probe layout — transcript above,
+// "△ Permission required" header, detail rows, options row 3rd from bottom
+// — must extract (options-first walk-up) and hold busy.
+func TestPermDialogProbedShape(t *testing.T) {
+	frame := "  ┃  streaming text above the dialog\n" +
+		"  ┃  more transcript\n" +
+		"  ┃\n" +
+		"  ┃  △ Permission required\n" +
+		"  ┃    # Shell command\n" +
+		"  ┃  $ touch /root/marker.txt\n" +
+		"  ┃  - /root/marker.txt\n" +
+		"  ┃   Allow once   Allow always   Reject\n" +
+		"  ┃\n" +
+		"  ┃\n"
+	block, ok := extractPermDialog(frame)
+	if !ok {
+		t.Fatal("probed perm shape must extract")
+	}
+	if !strings.Contains(block, "Permission required") || !strings.Contains(block, "Allow once") {
+		t.Fatalf("block = %q", block)
+	}
+	if !paneBusy(frame) {
+		t.Fatal("permission page 1 must hold busy")
+	}
+}
+
+// TestModelDialogPairGate: the model dialog is a floating overlay — its
+// header text alone (README quote) must never count; the header paired
+// with the "Connect provider" action bar must.
+func TestModelDialogPairGate(t *testing.T) {
+	echo := "  ┃  `Select model`（模型对话框）\n" +
+		"  tab agents  ctrl+p commands\n"
+	if modelDialogPresent(echo) {
+		t.Fatal("header echo without the action bar must not count")
+	}
+	if rows := parseModelDialogRows(echo); len(rows) != 0 {
+		t.Fatalf("rows on echo = %v, want none", rows)
+	}
+	real := "  ┃  Select model\n" +
+		"  ┃  GLM-5.3 OpenCode Go\n" +
+		"  ┃  GLM-5.3-Flash OpenCode Go\n" +
+		"  ┃  qwen3.8-max yzr\n" +
+		"  ┃  Connect provider ctrl+a  Favorites\n"
+	if !modelDialogPresent(real) {
+		t.Fatal("header + action bar must count")
+	}
+	rows := parseModelDialogRows(real)
+	if len(rows) != 2 || !strings.Contains(rows[0], "GLM-5.3-Flash") {
+		t.Fatalf("rows = %v, want the two model rows after the input line", rows)
+	}
+}
+
+// TestPaneIdleZoneOnly: /llmw_new's confirmation reads the idle hint from
+// the bottom chrome zone only — a README echo of the hint text high in the
+// transcript must not confirm (2026-09-06 audit follow-up; the predicate
+// was a full-pane Contains).
+func TestPaneIdleZoneOnly(t *testing.T) {
+	echo := "  ┃  README: wait for idle footer `" + paneIdleHint + "` quote\n" +
+		"  ┃  transcript filler one\n" +
+		"  ┃  transcript filler two\n" +
+		"  ┃  transcript filler three\n" +
+		"  ┃  transcript filler four\n" +
+		"  ┃  transcript filler five\n" +
+		"  ┃\n" +
+		"  ┃  Build · glm-5.3\n" +
+		"  ╹▀▀▀▀▀▀▀▀▀▀▀\n" +
+		"  /ws/probe  ⊙ 1 MCP /status\n"
+	if paneIdle(echo) {
+		t.Fatal("idle-hint echo in the transcript must not read idle")
+	}
+	real := echo + "  tab agents  " + paneIdleHint + "\n"
+	if !paneIdle(real) {
+		t.Fatal("real hint in the bottom chrome must read idle")
+	}
+}
+
+// TestModelDialogEchoAboveRealDialog: parsing must anchor to the header
+// NEAREST above the action bar (what modelDialogLocate finds), never the
+// topmost echoed "Select model" line — otherwise garbage transcript rows
+// between the echo and the real dialog feed wrong Down-key counts.
+func TestModelDialogEchoAboveRealDialog(t *testing.T) {
+	frame := "  ┃  `Select model`（模型对话框）echoed high up\n" +
+		"  ┃  transcript filler row\n" +
+		"  ┃  Select model\n" +
+		"  ┃  GLM-5.3 OpenCode Go\n" +
+		"  ┃  GLM-5.3-Flash OpenCode Go\n" +
+		"  ┃  qwen3.8-max yzr\n" +
+		"  ┃  Connect provider ctrl+a  Favorites\n"
+	if !modelDialogPresent(frame) {
+		t.Fatal("real header+action-bar pair must be present")
+	}
+	rows := parseModelDialogRows(frame)
+	if len(rows) != 2 || !strings.Contains(rows[0], "GLM-5.3-Flash") {
+		t.Fatalf("rows = %v, want the two rows below the REAL header (echo ignored)", rows)
+	}
+}
+
+// TestModelDialogFooterPairHardening: the README zone doc quotes the bare
+// words "Connect provider" — that echo plus a header echo must NOT count
+// as the dialog; the real action bar carries ctrl+a / Favorites on the
+// same row (probed 2026-09-06).
+func TestModelDialogFooterPairHardening(t *testing.T) {
+	echo := "  ┃  配对闸：header + `Connect provider` 行\n" +
+		"  ┃  filler\n" +
+		"  ┃  `Select model`（模型对话框）\n" +
+		"  tab agents  ctrl+p commands\n"
+	if modelDialogPresent(echo) {
+		t.Fatal("bare Connect provider echo must not pair")
+	}
+	if rows := parseModelDialogRows(echo); len(rows) != 0 {
+		t.Fatalf("rows on bare echo = %v, want none", rows)
+	}
+}
+
+// TestTallQuestionDialogStillParses: a 6-option dialog with description
+// rows and a wrapped question spans ~20 non-empty rows — paneDialogZone=30
+// must keep the question text inside the walk-up so the L2 card still
+// parses (zone 18 clipped it to a fallback notice).
+func TestTallQuestionDialogStillParses(t *testing.T) {
+	b := "  ┃  transcript above the tall dialog\n" +
+		"  ┃  more filler\n" +
+		"  ┃\n" +
+		"  ┃  A long question that wraps across multiple lines, first\n" +
+		"  ┃  second line of the wrapped question text\n" +
+		"  ┃\n"
+	for i, o := range []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta"} {
+		b += "  ┃  " + strconv.Itoa(i+1) + ". " + o + "\n"
+		b += "  ┃     description of " + o + "\n"
+	}
+	b += "  ┃  7. Type your own answer\n"
+	b += "  ┃                                                                  /tmp/opencode/probe\n"
+	b += "  ┃  ⇆ select  enter " + "sub" + "mit  esc " + "dis" + "miss\n"
+	block, ok := extractQuestionDialog(b)
+	if !ok {
+		t.Fatal("tall dialog must extract (zone 30)")
+	}
+	q, _, _, pok := parseQuestionPage(block)
+	if !pok {
+		t.Fatal("tall dialog must parse to a card, not degrade to a notice")
+	}
+	if !strings.Contains(q.Question, "wraps across multiple lines") || len(q.Options) != 6 {
+		t.Fatalf("question = %q, options = %d (want 6 — the free-text entry is an affordance, not an option)", q.Question, len(q.Options))
+	}
+}
+
+// TestTallPermDialogStillExtracts: a long wrapped command plus pattern
+// rows can push the header ~24 line-rows above the options row — the
+// walk-up bound (25) must still reach it or the dialog goes invisible and
+// the turn hangs to the 10-minute timeout.
+func TestTallPermDialogStillExtracts(t *testing.T) {
+	b := "  ┃  △ Permission required\n" +
+		"  ┃    # Shell command\n" +
+		"  ┃  $ cd /root/some/very/long/path && make build-noweb && cp ./llmw\n"
+	for i := 0; i < 16; i++ {
+		b += "  ┃  wrapped-command-fragment-line-" + strconv.Itoa(i) + "\n"
+	}
+	b += "  ┃  - /root/some/very/long/path/*\n"
+	for i := 0; i < 4; i++ {
+		b += "  ┃\n"
+	}
+	b += "  ┃   Allow once   Allow always   Reject\n" +
+		"  ┃\n"
+	block, ok := extractPermDialog(b)
+	if !ok {
+		t.Fatal("tall perm dialog (header ~24 rows up) must extract (walk-up 25)")
+	}
+	if !strings.Contains(block, "Permission required") || !strings.Contains(block, "Allow once") {
+		t.Fatalf("block = %q", block)
+	}
+}
+
+// TestTornFrameDoesNotReemitCard: a torn mid-redraw frame (blank capture)
+// between two identical dialog frames must not clear the question state
+// and re-emit a duplicate card — the debounce requires two consecutive
+// misses (paneStableNeeded idea).
+func TestTornFrameDoesNotReemitCard(t *testing.T) {
+	s, r := newDriverForTest(t)
+	r.mu.Lock()
+	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_tf", Directory: "/ws/foo", Updated: 9000}})
+	e := ocExport{}
+	e.Messages = append(e.Messages, ocMsg("user", "hi"), ocMsg("assistant", "done"))
+	r.exports["ses_tf"] = marshalExport(t, e)
+	frame := questionDialogFrame("coffee or tea?", "coffee", "tea")
+	r.captures = []string{
+		"idle ctrl+p",
+		"working " + "esc " + "inter" + "rupt",
+		frame,
+		frame, // consumed by RespondPermission's verification capture
+		"",    // torn mid-redraw frame: one miss must NOT clear qFP
+		frame, // same fingerprint: no re-emit
+		"idle ctrl+p",
+		"idle ctrl+p",
+	}
+	r.mu.Unlock()
+
+	if err := s.Send("hi", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	reqs, fp := 0, ""
+	deadline := time.After(3 * time.Second)
+	done := false
+	for !done {
+		select {
+		case ev := <-s.Events():
+			switch ev.Type {
+			case core.EventPermissionRequest:
+				reqs++
+				fp = ev.RequestID
+				if err := s.RespondPermission(fp, core.PermissionResult{
+					Behavior:     "allow",
+					UpdatedInput: map[string]any{"answers": map[string]any{"coffee or tea?": "tea"}},
+				}); err != nil {
+					t.Fatalf("RespondPermission: %v", err)
+				}
+			case core.EventResult:
+				done = ev.Done
+			}
+		case <-deadline:
+			t.Fatal("no result event within timeout")
+		}
+	}
+	if reqs != 1 {
+		t.Fatalf("requests = %d, want 1 (torn frame must not re-emit)", reqs)
+	}
+	if got := r.SentTexts(); !reflect.DeepEqual(got, []string{"2"}) {
+		t.Fatalf("sentTexts = %v, want the answer digit", got)
 	}
 }
