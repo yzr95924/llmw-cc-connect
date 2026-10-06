@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -91,7 +92,29 @@ func TestLivePaneSmoke(t *testing.T) {
 		t.Fatalf("tmux session %q already exists; clean it up first (tmux kill-session -t %s)", liveSmokeSession, liveSmokeSession)
 	}
 	dir := t.TempDir()
-	if err := liveSmokeTmux("new-session", "-d", "-s", liveSmokeSession, "-x", "178", "-y", "50", "-c", dir, "opencode"); err != nil {
+	// v2 defaults to auto-approve ("Build auto" in the bar), which would let
+	// stage 3's marker command run without any dialog. Pin an ask policy in
+	// the sandbox project so the permission-dialog path is always exercised;
+	// a fresh project registers with the shared service config-first.
+	permCfg := `{
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "ask" },
+    { "action": "edit", "resource": "*", "effect": "ask" },
+    { "action": "external_directory", "resource": "*", "effect": "ask" }
+  ]
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "opencode.json"), []byte(permCfg), 0o644); err != nil {
+		t.Fatalf("sandbox permission config: %v", err)
+	}
+	// --standalone: the sandbox runs its own private server, which reads
+	// the fresh project config above; the shared background service must
+	// never be touched by the gate anyway. OPENCODE_CLI_CONFIG_CONTENT
+	// forces permission PROMPTS regardless of the host cli.json — this
+	// machine runs session.permissions=autoaccept, which would auto-approve
+	// stage 3's ask rule and skip the dialog entirely (probed 2026-10-05).
+	cliEnv := "OPENCODE_CLI_CONFIG_CONTENT=" + `{"session":{"permissions":"prompt"}}`
+	if err := liveSmokeTmux("new-session", "-d", "-s", liveSmokeSession, "-x", "178", "-y", "50", "-c", dir, "env", cliEnv, "opencode", "--standalone"); err != nil {
 		t.Fatalf("sandbox tmux session: %v", err)
 	}
 	t.Cleanup(func() { _ = liveSmokeTmux("kill-session", "-t", liveSmokeSession) })
@@ -110,6 +133,54 @@ func TestLivePaneSmoke(t *testing.T) {
 		t.Fatalf("stage 1: SelfCheck failed against the real TUI: %s", warn)
 	}
 	t.Log("stage 1 ✓ anchor self-check")
+
+	// --standalone draws the footer before the private server finishes
+	// booting: a Send at first-footer loses the pasted prompt (empty-box
+	// submit, probed 2026-10-05). The mode bar appears once the input
+	// box is actually live, so gate on it.
+	if !s.waitPane(func(c string) bool { return paneBarRe.FindString(c) != "" }, 20*time.Second) {
+		t.Fatal("stage 1b: mode bar never appeared (private server boot)")
+	}
+
+	// Boot-stability gate (stage 1c): the client re-renders during private
+	// server + MCP spin-up (bottom line flips blank → "0 MCP" → "N MCP"),
+	// and a paste landing inside that window is silently dropped — the
+	// turn then runs on an EMPTY prompt (probed 2026-10-05: replies
+	// "Hi! What can I help you with today?"). Require the bottom chrome
+	// line to hold still across consecutive captures before the first Send.
+	bottomLine := func() string {
+		cap, err := s.runner.capture()
+		if err != nil {
+			return ""
+		}
+		nonEmpty := []string{}
+		for _, l := range strings.Split(cap, "\n") {
+			if strings.TrimSpace(l) != "" {
+				nonEmpty = append(nonEmpty, strings.TrimSpace(l))
+			}
+		}
+		if len(nonEmpty) == 0 {
+			return ""
+		}
+		return nonEmpty[len(nonEmpty)-1]
+	}
+	stable, same := 0, ""
+	deadlineBoot := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadlineBoot) {
+		b := bottomLine()
+		if b != "" && b == same {
+			stable++
+		} else {
+			stable, same = 0, b
+		}
+		if stable >= 2 { // 3 consecutive identical non-empty bottom lines
+			break
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	if stable < 2 {
+		t.Fatal("stage 1c: bottom chrome line never stabilized (boot loop?)")
+	}
 
 	// ---- Stage 2: full turn roundtrip (inject → busy cycle → export reply) ----
 	if err := s.Send("Reply with exactly this word and nothing else: pong", "", nil, nil); err != nil {

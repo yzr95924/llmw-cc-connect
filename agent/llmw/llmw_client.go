@@ -29,13 +29,14 @@ const (
 var errClosed = errors.New("llmw: session closed")
 
 // wikiEntry mirrors one row of `llmw list --json` (llmw/workspace/manager.py).
+// The llmw CLI's model overlay was removed (workspace_local.toml legacy keys
+// are ignored): wikis run the global opencode default model, so there is no
+// per-wiki model field anymore.
 type wikiEntry struct {
 	Name         string   `json:"name"`
 	Path         string   `json:"path"`
 	DisplayName  string   `json:"display_name"`
 	Tags         []string `json:"tags"`
-	Model        string   `json:"model"`
-	ModelSource  string   `json:"model_source"`
 	DirExists    bool     `json:"wiki_dir_exists"`
 	LastActivity string   `json:"last_activity"`
 }

@@ -26,8 +26,8 @@ func fakeRunner(out string, errMsg string) func(ctx context.Context, args ...str
 
 func sampleWikisJSON() string {
 	rows := []wikiEntry{
-		{Name: "agent-tools", Path: "agent-tools", DisplayName: "agent-tools", Model: "glm-5_2-1m", DirExists: true},
-		{Name: "kv-store", Path: "kv-store", DisplayName: "kv_store", Model: "glm-5_2-1m", DirExists: true},
+		{Name: "agent-tools", Path: "agent-tools", DisplayName: "agent-tools", DirExists: true},
+		{Name: "kv-store", Path: "kv-store", DisplayName: "kv_store", DirExists: true},
 		{Name: "ghost", Path: "ghost", DisplayName: "ghost", DirExists: false},
 	}
 	b, _ := json.Marshal(rows)
@@ -45,7 +45,7 @@ func TestLlmwClientList(t *testing.T) {
 	if len(wikis) != 3 {
 		t.Fatalf("want 3 wikis, got %d", len(wikis))
 	}
-	if wikis[0].Name != "agent-tools" || wikis[0].Path != "agent-tools" || wikis[0].Model != "glm-5_2-1m" {
+	if wikis[0].Name != "agent-tools" || wikis[0].Path != "agent-tools" {
 		t.Fatalf("unexpected row: %+v", wikis[0])
 	}
 	if !wikis[0].DirExists {
@@ -481,18 +481,16 @@ func TestRenderWindows(t *testing.T) {
 }
 
 // Context-size extraction: total wins, zero-token rows are skipped, and the
-// fallback sums input+cache when total is absent.
+// fallback sums input+cache when total is absent (v2 exports have no total,
+// so the fallback is the live path).
 func TestContextSizeFromExport(t *testing.T) {
 	var e ocExport
-	e.Messages = append(e.Messages, ocMessage{})
-	e.Messages[0].Info.Role = "user"
-	e.Messages[0].Parts = []ocPart{{Type: "text", Text: "hi"}}
-	mk := func(role string, total, in, read int) ocMessage {
-		m := ocMessage{}
-		m.Info.Role = role
-		m.Info.Tokens.Total = total
-		m.Info.Tokens.Input = in
-		m.Info.Tokens.Cache.Read = read
+	e.Messages = append(e.Messages, ocMessage{Type: "user", Text: "hi"})
+	mk := func(kind string, total, in, read int) ocMessage {
+		m := ocMessage{Type: kind}
+		m.Tokens.Total = total
+		m.Tokens.Input = in
+		m.Tokens.Cache.Read = read
 		return m
 	}
 	e.Messages = append(e.Messages, mk("assistant", 0, 0, 0)) // mid-turn zeros

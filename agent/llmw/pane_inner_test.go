@@ -124,19 +124,7 @@ func TestPaneCursorDiffAcrossTurns(t *testing.T) {
 		sesID = id
 	}
 	exp := ocExport{}
-	exp.Messages = append(exp.Messages, ocMessage{})
-	exp.Messages[0].Info.Role = "user"
-	exp.Messages[0].Parts = []ocPart{{Type: "text", Text: "one"}}
-	m1 := ocMessage{}
-	m1.Info.Role = "assistant"
-	m1.Parts = []ocPart{{Type: "text", Text: "first"}}
-	m2 := ocMessage{}
-	m2.Info.Role = "user"
-	m2.Parts = []ocPart{{Type: "text", Text: "two"}}
-	m3 := ocMessage{}
-	m3.Info.Role = "assistant"
-	m3.Parts = []ocPart{{Type: "text", Text: "second"}}
-	exp.Messages = append(exp.Messages, m1, m2, m3)
+	exp.Messages = append(exp.Messages, ocMsg("user", "one"), ocMsg("assistant", "first"), ocMsg("user", "two"), ocMsg("assistant", "second"))
 	r.exports[sesID] = marshalExport(t, exp)
 	r.captures = append(r.captures, "idle ctrl+p", "… esc interrupt …", "idle ctrl+p", "idle ctrl+p")
 	r.mu.Unlock()
@@ -162,18 +150,12 @@ func TestPaneDiscoveryMatchesPrompt(t *testing.T) {
 	r.sessions = marshalRows([]ocSessionRow{newest, ours, other})
 	// Newest session's last user message is someone else's text.
 	expNewest := ocExport{}
-	expNewest.Messages = append(expNewest.Messages, ocMessage{})
-	expNewest.Messages[0].Info.Role = "user"
-	expNewest.Messages[0].Parts = []ocPart{{Type: "text", Text: "human sibling text"}}
-	// Ours contains the injected prompt.
+	expNewest.Messages = append(expNewest.Messages, ocMsg("user", "human sibling text"))
+	// Ours contains the injected prompt (v2 puts user text in .text; the
+	// discovery match must stay padding-tolerant).
 	expOurs := ocExport{}
-	expOurs.Messages = append(expOurs.Messages, ocMessage{})
-	expOurs.Messages[0].Info.Role = "user"
-	expOurs.Messages[0].Parts = []ocPart{{Type: "text", Text: "  find me  "}} // padding tolerant
-	m := ocMessage{}
-	m.Info.Role = "assistant"
-	m.Parts = []ocPart{{Type: "text", Text: "matched reply"}}
-	expOurs.Messages = append(expOurs.Messages, m)
+	expOurs.Messages = append(expOurs.Messages, ocMessage{Type: "user", Text: "  find me  "})
+	expOurs.Messages = append(expOurs.Messages, ocMsg("assistant", "matched reply"))
 	r.exports = map[string]string{
 		"ses_newest": marshalExport(t, expNewest),
 		"ses_ours":   marshalExport(t, expOurs),
@@ -203,9 +185,7 @@ func TestPaneDiscoveryNoFallback(t *testing.T) {
 	newest := ocSessionRow{ID: "ses_foreign", Directory: "/ws/foo", Updated: 3000}
 	r.sessions = marshalRows([]ocSessionRow{newest})
 	expForeign := ocExport{}
-	expForeign.Messages = append(expForeign.Messages, ocMessage{})
-	expForeign.Messages[0].Info.Role = "user"
-	expForeign.Messages[0].Parts = []ocPart{{Type: "text", Text: "someone else entirely"}}
+	expForeign.Messages = append(expForeign.Messages, ocMsg("user", "someone else entirely"))
 	r.exports = map[string]string{"ses_foreign": marshalExport(t, expForeign)}
 	r.captures = append(r.captures, "idle ctrl+p", "… esc interrupt …", "idle ctrl+p", "idle ctrl+p")
 	r.mu.Unlock()
@@ -326,21 +306,11 @@ func TestPaneRediscoveryDoesNotDumpHistory(t *testing.T) {
 	// One session carrying 3 old turns plus the current one.
 	exp := ocExport{}
 	for i := 0; i < 3; i++ {
-		u := ocMessage{}
-		u.Info.Role = "user"
-		u.Parts = []ocPart{{Type: "text", Text: fmt.Sprintf("history q%d", i)}}
-		a := ocMessage{}
-		a.Info.Role = "assistant"
-		a.Parts = []ocPart{{Type: "text", Text: fmt.Sprintf("history a%d", i)}}
-		exp.Messages = append(exp.Messages, u, a)
+		exp.Messages = append(exp.Messages,
+			ocMsg("user", fmt.Sprintf("history q%d", i)),
+			ocMsg("assistant", fmt.Sprintf("history a%d", i)))
 	}
-	u := ocMessage{}
-	u.Info.Role = "user"
-	u.Parts = []ocPart{{Type: "text", Text: "current question"}}
-	a := ocMessage{}
-	a.Info.Role = "assistant"
-	a.Parts = []ocPart{{Type: "text", Text: "current answer"}}
-	exp.Messages = append(exp.Messages, u, a)
+	exp.Messages = append(exp.Messages, ocMsg("user", "current question"), ocMsg("assistant", "current answer"))
 
 	r.mu.Lock()
 	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_hist", Directory: "/ws/foo", Updated: 9000}})
@@ -414,11 +384,11 @@ func waitTrace(t *testing.T, events <-chan core.Event, timeout time.Duration) (t
 	}
 }
 
-func ocMsg(role, text string) ocMessage {
-	m := ocMessage{}
-	m.Info.Role = role
-	m.Parts = []ocPart{{Type: "text", Text: text}}
-	return m
+func ocMsg(kind, text string) ocMessage {
+	if kind == "user" {
+		return ocMessage{Type: kind, Text: text}
+	}
+	return ocMessage{Type: kind, Parts: []ocPart{{Type: "text", Text: text}}}
 }
 
 // The pseudo-stream must feed tool events (progress cards) and text deltas
@@ -433,18 +403,17 @@ func TestPaneStreamToolEvents(t *testing.T) {
 		return marshalExport(t, e)
 	}
 	toolMsg := func(name, callID, cmd string) ocMessage {
-		m := ocMessage{}
-		m.Info.Role = "assistant"
+		m := ocMessage{Type: "assistant"}
 		m.Parts = []ocPart{{
-			Type:   "tool",
-			Tool:   name,
-			CallID: callID,
-			State:  &ocToolState{Status: "completed", Input: []byte(`{"command":"` + cmd + `"}`)},
+			Type:  "tool",
+			Name:  name,
+			ID:    callID,
+			State: &ocToolState{Status: "completed", Input: []byte(`{"command":"` + cmd + `"}`)},
 		}}
 		return m
 	}
 	v1 := mk(ocMsg("user", "hi"), ocMsg("assistant", "开始"))
-	v2 := mk(ocMsg("user", "hi"), ocMsg("assistant", "开始"), toolMsg("bash", "c1", "ls -la"), ocMsg("assistant", "完成"))
+	v2 := mk(ocMsg("user", "hi"), ocMsg("assistant", "开始"), toolMsg("shell", "c1", "ls -la"), ocMsg("assistant", "完成"))
 
 	r.mu.Lock()
 	r.sessions = marshalRows([]ocSessionRow{{ID: "ses_stream", Directory: "/ws/foo", Updated: 9000}})
@@ -459,8 +428,8 @@ func TestPaneStreamToolEvents(t *testing.T) {
 	if !done {
 		t.Fatal("turn must complete")
 	}
-	if len(tools) != 1 || tools[0] != "bash|ls -la" {
-		t.Fatalf("tools = %v, want one bash|ls -la event", tools)
+	if len(tools) != 1 || tools[0] != "shell|ls -la" {
+		t.Fatalf("tools = %v, want one shell|ls -la event", tools)
 	}
 	if joined := strings.Join(texts, ""); joined != "开始\n\n完成" {
 		t.Fatalf("joined texts = %q, want the full reply exactly once", joined)
@@ -2249,5 +2218,80 @@ func TestTornFrameDoesNotReemitCard(t *testing.T) {
 	}
 	if got := r.SentTexts(); !reflect.DeepEqual(got, []string{"2"}) {
 		t.Fatalf("sentTexts = %v, want the answer digit", got)
+	}
+}
+
+// v2 (2.0.x) bar shapes: the persistent bottom bar carries a lowercase
+// permission-mode word between the agent name and the separator
+// ("Build auto · <model> <provider>"), while the transient per-turn line
+// keeps the v1 shape ("Build · <model> · 12.3s"). Both must parse; prose
+// with two or more words before the dot must not.
+func TestPaneBarRegexV2Shapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		capture string
+		mode    string
+		model   string
+	}{
+		{"persistent build bar", "  ┃  Build auto · Qwen3.8 Flash yzr-dashscope\n", "build", "Qwen3.8 Flash yzr-dashscope"},
+		{"persistent plan bar", "  ┃  Plan auto · GLM-5.3 yzr-zai\n", "plan", "GLM-5.3 yzr-zai"},
+		{"transient turn line", "Build · Qwen3.8 Flash · 5.3s · 22.8 tok/s\n", "build", "Qwen3.8 Flash"},
+		{"v1-shaped bar still parses", "  ┃  Build · glm-5.2 yzr-glm-5_2-1m\n", "build", "glm-5.2 yzr-glm-5_2-1m"},
+		{"footer chrome does not match", "/tmp/ws  9.8K (1%)  ctrl+p commands\n", "", ""},
+		{"prose with two words before dot", "Plan your work · then execute\n", "", ""},
+		// Tolerated ambiguity: a single lowercase word between agent and
+		// dot matches the bar grammar. Safe by last-match-wins — the
+		// persistent bar is the lowest matching line in a capture, and
+		// prose only ever appears in the transcript above it (pinned by
+		// TestPaneBarRegexLastMatchWins).
+		{"single-word prose matches (known tolerance)", "Plan carefully · do it\n", "plan", "do it"},
+	}
+	for _, tc := range cases {
+		if got := currentPaneMode(tc.capture); got != tc.mode {
+			t.Errorf("%s: currentPaneMode = %q, want %q", tc.name, got, tc.mode)
+		}
+		if got := paneModelFromCapture(tc.capture); got != tc.model {
+			t.Errorf("%s: paneModelFromCapture = %q, want %q", tc.name, got, tc.model)
+		}
+	}
+}
+
+// The persistent bar sits below the transient per-turn line; the LAST
+// match must win so the advertised mode/model is the current one.
+func TestPaneBarRegexLastMatchWins(t *testing.T) {
+	cap := "Build · Qwen3.8 Flash · 5.3s\n\n  ┃  Plan auto · GLM-5.3 yzr-zai\n"
+	if got := currentPaneMode(cap); got != "plan" {
+		t.Fatalf("currentPaneMode = %q, want plan (persistent bar wins)", got)
+	}
+	if got := paneModelFromCapture(cap); got != "GLM-5.3 yzr-zai" {
+		t.Fatalf("paneModelFromCapture = %q, want the persistent bar's model", got)
+	}
+}
+
+// v2 exports interleave non-turn message kinds (synthetic/idle/system…)
+// around the turn; extraction must whitelist user/assistant only — the
+// last user message, not an idle/system row, bounds the reply walk.
+func TestExtractNewTextSkipsNonTurnMessages(t *testing.T) {
+	s := &paneSession{}
+	e := &ocExport{}
+	e.Messages = append(e.Messages,
+		ocMsg("user", "q1"), ocMsg("assistant", "a1"),
+		ocMessage{Type: "system", Text: "sys note"},
+		ocMessage{Type: "idle"},
+		ocMsg("user", "q2"),
+		ocMessage{Type: "synthetic", Text: "compaction_continue"},
+		ocMsg("assistant", "a2 first"),
+		ocMessage{Type: "idle"},
+		ocMsg("assistant", "a2 second"),
+	)
+	got, err := s.extractNewText(e)
+	if err != nil {
+		t.Fatalf("extractNewText: %v", err)
+	}
+	if want := "a2 first\n\na2 second"; got != want {
+		t.Fatalf("extractNewText = %q, want %q", got, want)
+	}
+	if got := lastUserText(e); got != "q2" {
+		t.Fatalf("lastUserText = %q, want q2", got)
 	}
 }

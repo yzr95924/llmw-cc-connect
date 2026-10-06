@@ -15,10 +15,14 @@ opencode 上）；`backend` option 写其他值会在启动时显式报错。
 - **输入**：tmux `load-buffer` + `paste-buffer -p` + Enter（bracketed paste 保多行完整）。
 - **回合完成检测**：轮询 `capture-pane`，`esc interrupt` 忙标记出现过后消失且画面
   稳定 = 回合结束；权限弹窗在场也算忙（弹窗期间忙标记会消失）。
-- **回复内容**：`opencode export <session>`（屏幕 capture 找不回滚走的内容）；
-  会话经 `opencode session list --format json` 按目录发现、注入文本匹配确认后粘住。
+- **回复内容**：`opencode session export <session>`（v2 命令名；屏幕 capture 找不回
+  滚走的内容）；会话经 `opencode session list --format json` 按目录发现、注入文本匹
+  配确认后粘住。
 - **渐进推送**：回合内每 2s 轮询 export 快照做 diff，工具事件（EventToolUse）与
   文本增量按 part 顺序推给引擎——TG 进度卡实时滚动，钉钉 StreamingCard 打字机生效。
+  **opencode v2 粒度降级**（2026-10-05 实测 2.0.22）：export 按 assistant 消息完成
+  落盘——工具事件仍在每个 step 完成时实时可见，但正在生成的文本要等整条消息写完
+  才出现（v1 是逐段流式），IM 端长文本回复从打字机变成按块到达。
 - **权限弹窗**：TUI 弹窗（`Permission required` + Allow once / Allow always / Reject）
   被检测后以 IM 按钮呈现；用户选择经 Left/Right + Enter 按键回注（2026-08-30 实机探测）。
   **"Allow always" 有两级确认**（实机实证 2026-08-30）：第一级选 Allow always 后弹出
@@ -90,8 +94,8 @@ backend = "opencode"   # 唯一合法值（省略即默认）；写别的值启�
 | `/llmw_new` | **同窗口开启新会话**：注入 opencode TUI `/new`，窗口上下文清零，pane 绑定的 sticky session 重置（下条消息自动发现新 session）。**旧会话保留**在 opencode DB（`opencode session list` 可见、可续）——不删数据，无需确认。**生命周期不同于 /compact**：`/new` 不触发 busy 标记（2026-08-30 实测），走同步短等待（等空闲 footer `ctrl+p commands` 回现即确认，超时则提示"未确认执行"且不重置绑定）。引擎侧 transcript 也随新会话翻篇——缓解无限增长 |
 | `/llmw_abort` | **中止当前窗口进行中的回合**：向 TUI 发 ESC（忙判定取自实时 capture，**主机手动开的回合也能中止**）。中止后回合以已产出内容收尾（export 里的部分回复照常回包，无内容则回中止通知）。**边界**：权限/question 弹窗期间 ESC 只关弹窗不中止回合——再发一次 `/llmw_abort` 即可；进度卡停止按钮仍只拆 IM 侧会话、不触窗口 |
 | `/llmw_switch` | 列出 **live** 主机窗口（带序号 + 当前绑定标记），回复序号即换绑到该窗口（走 enter 路径：reattach 活窗，绝不建窗）。替代被禁用的引擎 `/switch`（其换绑依赖已删除的隐式 resume）。dead 窗口不列；无 live 窗口时提示 enter |
-| `/mode build` / `/mode plan` | 切 opencode 子代理（Tab 键 + 底栏确认；回合中拒绝热切换——但引擎仍回收会话，见"已知限制·回合中切模型/模式"） |
-| `/model` / `/model switch <名>` | 列出 / 切换模型（`opencode models` 清单按 `yzr*` 前缀过滤 + TG 按钮；经 TUI 模型对话框驱动，底栏确认；会话级，不改 overlay；回合中拒绝热切换——但引擎仍回收会话，见"已知限制·回合中切模型/模式"） |
+| `/mode build` / `/mode plan` | 切 opencode 子代理（**Shift+Tab** 键 + 底栏确认——v2 改键，v1 是 Tab；回合中拒绝热切换——但引擎仍回收会话，见"已知限制·回合中切模型/模式"） |
+| `/model` / `/model switch <名>` | 列出 / 切换模型（`opencode models` 清单按 `yzr*` 前缀过滤 + TG 按钮；经 TUI 模型对话框（`ctrl+x` `m`，v2 未变）驱动，底栏确认；会话级，**llmw 已无 per-wiki overlay**——wiki 用全局 opencode 默认模型；回合中拒绝热切换——但引擎仍回收会话，见"已知限制·回合中切模型/模式"） |
 | `/llmw_compact`（自定义命令，2026-09-05 替换内建 `/compress`） | 压缩当前窗口会话上下文（注入 opencode TUI `/compact`，等忙闲循环后回确认；TUI 命令不落库为消息，跳过回复提取；回合中拒绝）。**为什么替换内建**：`/model` 会回收引擎侧交互状态（无上游改动，headless agent 同病），内建 `/compress` 的前置检查拿不到活跃会话 → "没有活跃的会话可以压缩"（2026-09-05 实测）；自定义命令与普通消息同路（懒 spawn → 绑定记忆/ensureInner 重进），凡普通消息可达的状态都可用——同 `/llmw_abort` 替换 `/cancel` 先例。内建 `/compress` 已加入 `disabled_commands`（auto-compress 是 config opt-in、本项目未启用——引擎按会话历史文本估算 token，与 llmw 是否上报无关；`CompressCommand` 保留，若日后启用 auto-compress 它即生效路径）。注：若 `/compact` 未触发 TUI 忙标记（命令无效），将走到 10 分钟回合超时 |
 | 普通消息 | 注入当前 wiki 窗口的 TUI；窗口忙则拒发提示稍后重发 |
 
@@ -99,6 +103,9 @@ backend = "opencode"   # 唯一合法值（省略即默认）；写别的值启�
 
 ## 依赖与环境
 
+- **本 fork 只维护 llmw 后端**：与上游共享的其他后端包（`agent/opencode` 等）
+  保持上游原样、不携带 fork 改动——`type = "opencode"` 的 headless 路径在
+  opencode v2 下会因 `--dir` 报错不可用，v2 适配等上游自己做。
 - `llmw` 在 PATH（`llmw list --json` 可用）；workspace 根 = `$LLMW_WORKSPACE` 或
   `~/yzr-llm-wiki-workspace`（需含 `workspace.toml`）。
 - **daemon 环境必须有 `HOME`**（systemd system service 默认只给 `USER` 不给
@@ -110,7 +117,10 @@ backend = "opencode"   # 唯一合法值（省略即默认）；写别的值启�
   （登录 shell 启动）天然有 HOME，不受影响。
 - `enter_byobu=true`（`workspace_local.toml`）：IM `/llmw enter` 与主机
   `llmw wiki enter` 走同一命令，窗口天然共享。
-- `opencode` ≥ 1.18 在 PATH（`opencode session list --format json` / `opencode export`）。
+- `opencode` ≥ 2.0 在 PATH（`@opencode/cli` npm 轨；`opencode session list
+  --format json` / `opencode session export`）。**v2 是 client-server**：所有窗口/
+  headless 调用共享一个后台服务，项目配置（含权限规则）改动后需
+  `opencode service restart` 才生效（2026-10-05 实测）。
 - 构建：`make build-noweb`（fork 惯例，web 管理界面排除出二进制）。
 
 ## 已知限制
@@ -270,12 +280,30 @@ go test -tags live -run TestLivePaneSmoke -v -timeout 600s ./agent/llmw/
 RSS），本机 3.5GB 无 swap——2026-09-06 曾因多 opencode 叠加把主机硬压死
 （14:14 冻结）。测试已加守卫（MemAvailable < 1500MB 自动 skip），手动跑前
 `free -m` 确认余量。TUI 屏幕文本锚点（大版本改版需重新探测，锚点定义都在
-`pane_inner.go` 顶部常量/注释）：`esc interrupt`（busy）、`Permission required` /
-`Allow once`（权限页 1）、`This will allow the following patterns`（权限页 2）、
-`↑↓ select / enter submit（或 enter confirm）/ esc dismiss`（question 弹窗——
-多问题页是 enter confirm）、`⇆ tab enter submit esc dismiss` 且无 select
-（多问题 Confirm 页，pane 自动提交）、`Select model`（模型
-对话框）、`Build · <model>`（底栏）。
+`pane_inner.go` 顶部常量/注释）：`esc interrupt`（busy，2.0.22 复测仍在）、
+`Permission required` / `Allow once`（权限页 1，**2.0.22 live 冒烟实测仍兼容**）、
+`This will allow the following patterns`（权限页 2——live 冒烟只覆盖 allow-once，
+Allow always 两级确认仍需人工验一次）、`↑↓ select / enter submit（或 enter
+confirm）/ esc dismiss`（question 弹窗——多问题页是 enter confirm，**2.0.22 L2
+卡片路径实测通过**）、`⇆ tab enter submit esc dismiss` 且无 select（多问题
+Confirm 页，pane 自动提交）、`Select model`（模型对话框，2.0.22 复测仍在，配对
+闸的 ctrl+a 行文案变为 `Connect an integration ctrl+a  Favorite ctrl+f`——仍含
+ctrl+a，闸不受影响）、`Build auto · <model> <provider>`（底栏，2.0.22 格式——
+agent 与 `·` 之间多了一个小写权限模式词，正则已适配；旧行 `Build · <model>`
+形态仍兼容）。
+
+**v2 权限语义（2026-10-05 实测 2.0.22，两道闸都踩过）**：
+① v2 默认基线策略是 `*/* → allow`——没配 ask 规则就全放行（v1 是默认问）；
+② **本机 `~/.config/opencode/cli.json` 设了 `session.permissions =
+"autoaccept"`**——CLI 级自动接受一切权限请求，只认显式 deny。生产窗口因此
+**不会出现权限弹窗**（IM 权限按钮通道在本机休眠，属主机偏好）；ask 规则要弹窗
+需 cli 设 `"prompt"`（可用 `OPENCODE_CLI_CONFIG_CONTENT` 环境变量覆盖）。
+live 冒烟即用该覆盖自持地逼出弹窗。若日后把主机切回 prompt 模式，IM 按钮通道
+随 live 冒烟验证过的锚点自动生效。
+
+**v2 client-server 运维差异**：所有 byobu 窗口的 TUI 与 headless 调用连同一个
+后台服务；升级 opencode 二进制后建议 `opencode service restart` 再跑 live 冒烟
+（旧服务进程可能仍持有旧版行为）。
 
 **页脚跨版本漂移**（2026-09-06 实测）：1.18.28 单问题页脚是 `⇆ select …`，
 1.18.29 是 `↑↓ select …`（无 ⇆）——锚点闸接受二者任一（⇆ 或 ↑↓ 按键提示符），

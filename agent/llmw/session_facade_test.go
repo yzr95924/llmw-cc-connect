@@ -138,7 +138,7 @@ func (r *fakePaneRunner) sendKey(key string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sentKeys = append(r.sentKeys, key)
-	if key == "Tab" && (r.uiMode == "build" || r.uiMode == "plan") {
+	if key == "BTab" && (r.uiMode == "build" || r.uiMode == "plan") {
 		if r.uiMode == "build" {
 			r.uiMode = "plan"
 		} else {
@@ -161,7 +161,10 @@ func (r *fakePaneRunner) capture() (string, error) {
 		} else if bar == "plan" {
 			bar = "Plan"
 		}
-		return "  ┃  " + bar + " · qwen3.8-max llmw registry\n", nil
+		// v2 persistent bar shape: "<Agent> auto · <model> <provider>"
+		// (probed 2.0.22; "auto" is the permission-mode word the bar
+		// regex must tolerate).
+		return "  ┃  " + bar + " auto · qwen3.8-max yzr-dashscope\n", nil
 	}
 	if len(r.captures) == 0 {
 		if r.lastCapture != "" {
@@ -190,7 +193,7 @@ func (r *fakePaneRunner) exportJSON(sessionID string) (string, error) {
 	if out, ok := r.exports[sessionID]; ok {
 		return out, nil
 	}
-	return "", fmt.Errorf("opencode export %s: not scripted", sessionID)
+	return "", fmt.Errorf("opencode session export %s: not scripted", sessionID)
 }
 
 // lastInjected returns the most recent injected prompt.
@@ -248,13 +251,7 @@ func (r *fakePaneRunner) scriptTurn(prompt, reply string) {
 	b, _ := json.Marshal(rows)
 	r.sessions = string(b)
 	exp := ocExport{}
-	exp.Messages = append(exp.Messages, ocMessage{})
-	exp.Messages[0].Info.Role = "user"
-	exp.Messages[0].Parts = []ocPart{{Type: "text", Text: prompt}}
-	m := ocMessage{}
-	m.Info.Role = "assistant"
-	m.Parts = []ocPart{{Type: "text", Text: reply}}
-	exp.Messages = append(exp.Messages, m)
+	exp.Messages = append(exp.Messages, ocMsg("user", prompt), ocMsg("assistant", reply))
 	eb, _ := json.Marshal(exp)
 	if r.exports == nil {
 		r.exports = map[string]string{}
@@ -288,8 +285,8 @@ func newTestAgent(t *testing.T) (*llmwAgent, *scriptRunner, map[string]*fakePane
 	}
 
 	wikis := []wikiEntry{
-		{Name: "foo", Path: "foo", DisplayName: "foo", Model: "m1", DirExists: true},
-		{Name: "bar", Path: "bar", DisplayName: "bar", Model: "m2", DirExists: true},
+		{Name: "foo", Path: "foo", DisplayName: "foo", DirExists: true},
+		{Name: "bar", Path: "bar", DisplayName: "bar", DirExists: true},
 	}
 	wikisJSON, _ := json.Marshal(wikis)
 	runner := &scriptRunner{list: string(wikisJSON)}

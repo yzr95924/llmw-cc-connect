@@ -635,7 +635,7 @@ func (f *sessionFacade) SetLiveMode(mode string) bool {
 }
 
 // SetLiveModel switches the opencode model of the window behind this
-// facade. Session-scoped: the llmw overlay and opencode.json stay untouched.
+// facade. Session-scoped: no config file is touched.
 func (f *sessionFacade) SetLiveModel(model string) error {
 	f.mu.Lock()
 	inner := f.inner
@@ -709,7 +709,7 @@ func (f *sessionFacade) handleWikisLocked() {
 		b.WriteString("\n")
 		b.WriteString(strconv.Itoa(i + 1))
 		b.WriteString(". ")
-		b.WriteString(displayWiki(&available[i], available[i].Model, ""))
+		b.WriteString(displayWiki(&available[i], "", ""))
 	}
 	b.WriteString("\n（或直接 /llmw enter <名> 进入）")
 	f.emitLocked(b.String())
@@ -811,7 +811,8 @@ func (f *sessionFacade) emitResultLocked() {
 
 // modelLabelLocked reports the model to advertise for the bound window:
 // the live pane bottom-bar model when readable (truth after /model hot
-// switches), else the wiki overlay's default. Cheap: one capture. Same
+// switches; the only source since llmw dropped per-wiki model overlays —
+// the fallback just omits the segment). Cheap: one capture. Same
 // live-first rule as modeLabelLocked so one display line never mixes
 // static and live sources.
 func (f *sessionFacade) modelLabelLocked() string {
@@ -822,12 +823,13 @@ func (f *sessionFacade) modelLabelLocked() string {
 			}
 		}
 	}
-	return f.wiki.Model
+	return ""
 }
 
 // modeLabelLocked reports the mode to advertise for the bound window: the
 // live pane subagent when readable (truth after enter-alignment or a manual
-// Tab in the host window), else the agent's target mode. Cheap: one capture.
+// Shift+Tab in the host window), else the agent's target mode. Cheap: one
+// capture.
 func (f *sessionFacade) modeLabelLocked() string {
 	if f.inner != nil {
 		if pm, ok := f.inner.(interface{ GetPaneMode() string }); ok {
@@ -845,8 +847,7 @@ func facadeID(wiki, innerID string) string {
 
 // displayWiki renders a wiki for enter confirmations, the status binding
 // line, and the list. model/mode are caller-chosen labels (live-first from
-// the facade for bound displays, static overlay values for the list); ""
-// omits the segment.
+// the facade for bound displays); "" omits the segment.
 func displayWiki(w *wikiEntry, model, mode string) string {
 	name := w.DisplayName
 	if name == "" {

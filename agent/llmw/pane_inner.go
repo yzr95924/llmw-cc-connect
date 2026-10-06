@@ -10,7 +10,8 @@ package llmw
 //     pane is stable. The marker is the only reliable signal: the idle-only
 //     hints ("ctrl+p commands") also show while working, and the pane
 //     freezes for >=1s mid-turn, so pure stability would fire early (PoC).
-//   - content: `opencode export <session>` — screen capture cannot recover
+//   - content: `opencode session export <session>` (v2; v1 was a bare
+//     `opencode export`) — screen capture cannot recover
 //     scrolled-off content (opencode redraws in place; tmux history never
 //     grows, even with alternate-screen off — PoC-verified). Sessions are
 //     discovered via `opencode session list --format json` filtered by
@@ -235,14 +236,19 @@ func (r *realPaneRunner) sessionListJSON() (string, error) {
 }
 
 func (r *realPaneRunner) exportJSON(sessionID string) (string, error) {
-	out, err := r.runOpencode("export", sessionID)
+	out, err := r.runOpencode("session", "export", sessionID)
 	if err != nil {
-		return "", fmt.Errorf("opencode export: %w", err)
+		return "", fmt.Errorf("opencode session export: %w", err)
 	}
 	return out, nil
 }
 
-// opencode CLI JSON contracts (field names verified against opencode 1.18.25).
+// opencode CLI JSON contracts (field names verified against opencode
+// 2.0.22). v2 export shape: messages carry a discriminant `type`
+// (user/assistant/synthetic/idle/system…), assistant messages hold their
+// parts under `content` and token usage at the top level, user messages
+// hold the prompt text in `text`. Non-user/assistant types are ignored by
+// whitelist, not enumeration — v2 minor releases keep adding kinds.
 type ocSessionRow struct {
 	ID        string `json:"id"`
 	Directory string `json:"directory"`
@@ -254,15 +260,15 @@ type ocExport struct {
 }
 
 type ocMessage struct {
-	Info struct {
-		Role   string   `json:"role"`
-		Tokens ocTokens `json:"tokens"`
-	} `json:"info"`
-	Parts []ocPart `json:"parts"`
+	Type   string   `json:"type"`
+	Text   string   `json:"text"` // user messages: the prompt
+	Tokens ocTokens `json:"tokens"`
+	Parts  []ocPart `json:"content"`
 }
 
-// ocTokens mirrors info.tokens in the export (verified against opencode
-// 1.18.25: total/input/output/reasoning + cache{read,write}).
+// ocTokens mirrors assistant-message tokens in the export (verified against
+// opencode 2.0.22: input/output/reasoning + cache{read,write}; v1's total
+// is gone — contextSize falls back to input+cache).
 type ocTokens struct {
 	Total     int `json:"total"`
 	Input     int `json:"input"`
@@ -291,10 +297,10 @@ func contextSizeFromExport(raw string) (int, error) {
 		return 0, err
 	}
 	for i := len(e.Messages) - 1; i >= 0; i-- {
-		if e.Messages[i].Info.Role != "assistant" {
+		if e.Messages[i].Type != "assistant" {
 			continue
 		}
-		if n := e.Messages[i].Info.Tokens.contextSize(); n > 0 {
+		if n := e.Messages[i].Tokens.contextSize(); n > 0 {
 			return n, nil
 		}
 	}
@@ -324,7 +330,7 @@ var contextSizeFn = func(ctx context.Context, workDir string) (int, error) {
 	if newest == "" {
 		return 0, fmt.Errorf("no opencode session under %s", workDir)
 	}
-	exp, err := runOpencodeDir(ctx, workDir, "export", newest)
+	exp, err := runOpencodeDir(ctx, workDir, "session", "export", newest)
 	if err != nil {
 		return 0, err
 	}
@@ -334,11 +340,12 @@ var contextSizeFn = func(ctx context.Context, workDir string) (int, error) {
 type ocPart struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
-	// Tool-call parts (Type == "tool"): name, dedup key, and state.input
-	// for the progress summary.
-	Tool   string       `json:"tool,omitempty"`
-	CallID string       `json:"callID,omitempty"`
-	State  *ocToolState `json:"state,omitempty"`
+	// Tool-call parts (Type == "tool"): name and dedup key in v2 are
+	// `name`/`id` (v1 called them tool/callID), and state.input feeds the
+	// progress summary.
+	Name  string       `json:"name,omitempty"`
+	ID    string       `json:"id,omitempty"`
+	State *ocToolState `json:"state,omitempty"`
 }
 
 type ocToolState struct {
@@ -756,35 +763,63 @@ func (s *paneSession) streamTick(promptEcho string, st *turnStream) {
 	}
 	// Walk the parts after the last user IN ORDER so tool events interleave
 	// with the text that preceded them (engines flush text at tool events).
-	// soFar builds the same canonical string as extractNewText; deltas are
-	// only emitted while it stays prefix-compatible with what was already
-	// delivered (a mid-stream rewrite simply stops the deltas — the final
+	// turnText keeps the accumulated prefix byte-identical to what
+	// extractNewText will finally deliver; deltas are only emitted while
+	// it stays prefix-compatible with what was already delivered (a
+	// mid-stream rewrite simply stops the deltas — the final
 	// reconciliation resends the full reply).
-	var soFar string
-	for i := lastUserIndex(&e) + 1; i < len(e.Messages); i++ {
-		if e.Messages[i].Info.Role != "assistant" {
+	var tt turnText
+	forEachTurnPart(&e, func(p ocPart) {
+		switch p.Type {
+		case "text":
+			tt.add(p)
+		case "tool":
+			if p.ID != "" && !st.tools[p.ID] {
+				s.emitTextUpTo(st, tt.String())
+				s.emit(core.Event{Type: core.EventToolUse, ToolName: p.Name, ToolInput: summarizeOcToolInput(&p)})
+				st.tools[p.ID] = true
+			}
+		}
+	})
+	s.emitTextUpTo(st, tt.String())
+}
+
+// forEachTurnPart is the single cursor over a turn's parts: it visits every
+// part of every assistant message after the last user message, in order.
+// Both the progressive stream (streamTick) and the final reply extraction
+// (extractNewText) must agree on what a turn contains — this walker is why
+// they cannot drift.
+func forEachTurnPart(e *ocExport, fn func(p ocPart)) {
+	for i := lastUserIndex(e) + 1; i < len(e.Messages); i++ {
+		if e.Messages[i].Type != "assistant" {
 			continue
 		}
 		for _, p := range e.Messages[i].Parts {
-			switch p.Type {
-			case "text":
-				if t := strings.TrimSpace(p.Text); t != "" {
-					if soFar != "" {
-						soFar += "\n\n"
-					}
-					soFar += t
-				}
-			case "tool":
-				if p.CallID != "" && !st.tools[p.CallID] {
-					s.emitTextUpTo(st, soFar)
-					s.emit(core.Event{Type: core.EventToolUse, ToolName: p.Tool, ToolInput: summarizeOcToolInput(&p)})
-					st.tools[p.CallID] = true
-				}
-			}
+			fn(p)
 		}
 	}
-	s.emitTextUpTo(st, soFar)
 }
+
+// turnText accumulates a turn's canonical text — trimmed text parts joined
+// by one blank line. Shared by streamTick (for prefixes at tool boundaries)
+// and extractNewText (for the final reply) so both build identical strings.
+type turnText struct {
+	sb strings.Builder
+}
+
+func (t *turnText) add(p ocPart) {
+	if p.Type != "text" {
+		return
+	}
+	if s := strings.TrimSpace(p.Text); s != "" {
+		if t.sb.Len() > 0 {
+			t.sb.WriteString("\n\n")
+		}
+		t.sb.WriteString(s)
+	}
+}
+
+func (t *turnText) String() string { return t.sb.String() }
 
 // emitTextUpTo emits the canonical-text delta between st.emitted and target.
 // Prefix-checked: a rewrite (target no longer extends the emitted text)
@@ -799,27 +834,23 @@ func (s *paneSession) emitTextUpTo(st *turnStream, target string) {
 // lastUserIndex returns the index of the last user message, or -1.
 func lastUserIndex(e *ocExport) int {
 	for i := len(e.Messages) - 1; i >= 0; i-- {
-		if e.Messages[i].Info.Role == "user" {
+		if e.Messages[i].Type == "user" {
 			return i
 		}
 	}
 	return -1
 }
 
-// lastUserText returns the trimmed first text part of the last user message.
+// lastUserText returns the trimmed prompt text of the last user message.
 func lastUserText(e *ocExport) string {
 	if i := lastUserIndex(e); i >= 0 {
-		for _, p := range e.Messages[i].Parts {
-			if p.Type == "text" {
-				return strings.TrimSpace(p.Text)
-			}
-		}
+		return strings.TrimSpace(e.Messages[i].Text)
 	}
 	return ""
 }
 
 // summarizeOcToolInput renders a one-line input summary for the progress
-// card (bash → command, file tools → path, generic → first string value).
+// card (shell → command, file tools → path, generic → first string value).
 func summarizeOcToolInput(p *ocPart) string {
 	if p.State == nil || len(p.State.Input) == 0 {
 		return ""
@@ -836,13 +867,13 @@ func summarizeOcToolInput(p *ocPart) string {
 		}
 		return ""
 	}
-	switch p.Tool {
-	case "bash":
+	switch p.Name {
+	case "shell":
 		return truncateRunes(pick("command"), 80)
-	case "read", "write", "edit", "multiedit", "glob", "grep":
+	case "read", "write", "edit", "patch", "glob", "grep":
 		return truncateRunes(pick("filePath", "file_path", "pattern", "path"), 80)
-	case "skill", "task":
-		return truncateRunes(pick("name", "subagent_type"), 40)
+	case "skill", "subagent":
+		return truncateRunes(pick("name", "agent", "subagent_type"), 40)
 	}
 	for _, v := range input {
 		if v, ok := v.(string); ok && strings.TrimSpace(v) != "" {
@@ -859,7 +890,8 @@ func truncateRunes(s string, n int) string {
 	return string([]rune(s)[:n]) + "…"
 }
 
-// fetchReply reads the turn's assistant text via the opencode export CLI.
+// fetchReply reads the turn's assistant text via the opencode session
+// export CLI.
 // Uses the sticky session id when it still resolves; rediscovers by matching
 // the injected prompt otherwise (fresh window, first turn).
 func (s *paneSession) fetchReply(promptEcho string) (string, error) {
@@ -922,37 +954,27 @@ func (s *paneSession) fetchReply(promptEcho string) (string, error) {
 // (2026-08-30: a cursor=0 rediscovery once replayed the entire session into
 // Telegram). The cursor only serves as the sticky fast-path staleness guard.
 func (s *paneSession) extractNewText(e *ocExport) (string, error) {
-	msgs := e.Messages
-	lastUser := lastUserIndex(e)
-	var sb strings.Builder
-	for i := lastUser + 1; i < len(msgs); i++ {
-		if msgs[i].Info.Role != "assistant" {
-			continue
-		}
-		for _, p := range msgs[i].Parts {
-			if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
-				if sb.Len() > 0 {
-					sb.WriteString("\n\n")
-				}
-				sb.WriteString(strings.TrimSpace(p.Text))
-			}
-		}
-	}
-	if sb.Len() == 0 {
-		return "", fmt.Errorf("no assistant reply after the last user message (len=%d)", len(msgs))
+	var tt turnText
+	forEachTurnPart(e, tt.add)
+	if tt.String() == "" {
+		return "", fmt.Errorf("no assistant reply after the last user message (len=%d)", len(e.Messages))
 	}
 	s.mu.Lock()
-	s.cursor = len(msgs)
+	s.cursor = len(e.Messages)
 	s.mu.Unlock()
-	return sb.String(), nil
+	return tt.String(), nil
 }
 
-// paneModeRe matches the TUI subagent indicator on the status lines: the
-// persistent bottom bar "┃  Build · <model> ..." / "┃  Plan · <model> ..." and
-// the transient per-turn line "▣  Build · <model> · 12.3s". The LAST match in
-// a capture is the persistent bar (it sits below everything else), so it
-// reports the CURRENT subagent even right after a switch.
-var paneModeRe = regexp.MustCompile(`(Build|Plan)\s*·`)
+// paneModeRe matches the TUI subagent indicator on the status lines. v2
+// (2.0.x, probed) renders the persistent bottom bar as
+// "Build auto · <model> <provider>" — an optional lowercase permission-mode
+// word sits between the agent and the "·" — while the transient per-turn
+// line keeps the v1 shape "Build · <model> · 12.3s". Both shapes must
+// match; prose like "Plan your work ·" (two words before the dot) must
+// not. The LAST match in a capture is the persistent bar (it sits below
+// everything else), so it reports the CURRENT subagent even right after
+// a switch.
+var paneModeRe = regexp.MustCompile(`(Build|Plan)(?:\s+[a-z]+)?\s*·`)
 
 // currentPaneMode scans a pane capture and returns "build", "plan", or ""
 // when no subagent indicator is readable (foreign dialog, wrong pane).
@@ -974,10 +996,11 @@ func normalizePaneMode(raw string) string {
 }
 
 // SetLiveMode switches the window's opencode subagent (Build ↔ Plan) by
-// sending Tab key presses and confirming via the status bar — the same hot
-// switch a human gets pressing Tab in the shared window. Only allowed while
-// no turn is running (Tab during a turn would land in the input box instead
-// of switching agents). Returns false when the switch could not be completed.
+// sending Shift+Tab key presses and confirming via the status bar — the
+// same hot switch a human gets in the shared window (v2 footer:
+// "shift+tab agents"; v1 used Tab). Only allowed while no turn is running
+// (Shift+Tab during a turn would land in the input box instead of
+// switching agents). Returns false when the switch could not be completed.
 func (s *paneSession) SetLiveMode(mode string) bool {
 	target := normalizePaneMode(mode)
 	if !s.alive.Load() || s.turnActive.Load() {
@@ -985,8 +1008,8 @@ func (s *paneSession) SetLiveMode(mode string) bool {
 	}
 	s.injectMu.Lock()
 	defer s.injectMu.Unlock()
-	// build ↔ plan needs one Tab; extra presses cover user-defined subagents
-	// cycling through the same key.
+	// build ↔ plan needs one Shift+Tab; extra presses cover user-defined
+	// subagents cycling through the same key.
 	for i := 0; i < 4; i++ {
 		cap, err := s.runner.capture()
 		if err != nil {
@@ -1001,8 +1024,8 @@ func (s *paneSession) SetLiveMode(mode string) bool {
 			slog.Warn("llmw pane: mode switch aborted, no subagent indicator in pane")
 			return false
 		}
-		if err := s.runner.sendKey("Tab"); err != nil {
-			slog.Warn("llmw pane: mode switch send Tab failed", "err", err)
+		if err := s.runner.sendKey("BTab"); err != nil {
+			slog.Warn("llmw pane: mode switch send Shift+Tab failed", "err", err)
 			return false
 		}
 		// Wait for the TUI to apply the switch before re-reading.
@@ -1022,11 +1045,13 @@ func (s *paneSession) SetLiveMode(mode string) bool {
 	return err == nil && currentPaneMode(cap) == target
 }
 
-// paneBarRe matches the TUI status lines — the input-area bar ("Build ·
-// glm-5.2 yzr-glm-5_2-1m") and the spinner line ("Build · glm-5.2 · 47.1s").
-// The segment stops at the next "·", so elapsed timers never leak in. The
-// LAST match wins (the bottom bar is rendered after the spinner).
-var paneBarRe = regexp.MustCompile(`(Build|Plan)\s*·\s*([^·\n]+)`)
+// paneBarRe matches the TUI status lines — the v2 input-area bar ("Build
+// auto · Qwen3.8 Flash yzr-dashscope", agent + optional permission word +
+// model display + provider) and the transient per-turn spinner line
+// ("Build · Qwen3.8 Flash · 47.1s", v1 shape). The model segment stops at
+// the next "·", so elapsed timers never leak in. The LAST match wins (the
+// bottom bar is rendered after the spinner).
+var paneBarRe = regexp.MustCompile(`(Build|Plan)(?:\s+[a-z]+)?\s*·\s*([^·\n]+)`)
 
 // paneModelFromCapture returns the model segment of the bottom bar, e.g.
 // "glm-5.2 yzr-glm-5_2-1m" (custom providers: model id + provider id) or

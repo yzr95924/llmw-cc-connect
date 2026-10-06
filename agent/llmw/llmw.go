@@ -8,7 +8,8 @@
 //     facade to the wiki's byobu window and its opencode TUI pane
 //   - prompts are injected with tmux paste-buffer (bracketed paste keeps
 //     multi-line text intact), turn completion is detected from the pane's
-//     busy marker, and replies are recovered from `opencode export`
+//     busy marker, and replies are recovered from `opencode session
+//     export`
 //   - permission dialogs in the TUI surface as IM approval buttons (the
 //     choice is injected back as Left/Right + Enter key presses)
 //   - the agent session ID encodes the bound wiki ("llmw:<wiki>:<pane>"),
@@ -174,7 +175,8 @@ func (a *llmwAgent) PermissionModes() []core.PermissionModeInfo {
 //     llmw window. v3 drives the in-window TUI; only opencode is wired so far
 //     (claude needs its own state patterns and reply source, see design doc).
 //   - everything else is accepted and ignored (the pane driver needs no
-//     per-backend agent options; the wiki overlay configures the TUI).
+//     per-backend agent options; the global opencode config drives the TUI
+//     — llmw dropped per-wiki model overlays in its 2026-10 upgrade).
 func New(opts map[string]any) (core.Agent, error) {
 	backend, _ := opts["backend"].(string)
 	if backend == "" {
@@ -502,7 +504,7 @@ func parseFacadeID(id string) (wiki, innerID string, ours bool) {
 }
 
 // modelsListFn lists "provider/model" ids from the GLOBAL opencode config
-// (neutral workdir: wiki overlays must not leak into the list). Swappable
+// (neutral workdir: project configs must not leak into the list). Swappable
 // for tests.
 var modelsListFn = func(ctx context.Context) (string, error) {
 	return runOpencodeDir(ctx, "", "models")
@@ -523,9 +525,9 @@ func (a *llmwAgent) AvailableModels(ctx context.Context) []core.ModelOption {
 		if line == "" || seen[line] {
 			continue
 		}
-		// Only the yzr* providers: they are the ones the llmw overlay
-		// actually configures — the builtin opencode catalogs (128 models)
-		// are noise for this workspace.
+		// Only the yzr* providers: this workspace's own provider
+		// convention — the builtin opencode catalogs (128 models) are
+		// noise here.
 		if provider, _ := splitModelID(line); !strings.HasPrefix(provider, "yzr") {
 			continue
 		}
