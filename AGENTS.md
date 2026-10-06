@@ -276,3 +276,8 @@ Available tags: `no_acp`, `no_claudecode`, `no_codex`, `no_copilot`, `no_cursor`
 6. Optionally implement `AgentDoctorInfo` for `cc-connect doctor` support
 7. Add config example in `config.example.toml`
 8. Add unit tests
+
+## 跨会话记忆（索引）
+
+<!-- 下方 @引用若未被自动展开（看不到正文），用 Read 工具读取 -->
+@MEMORY/MEMORY.md
